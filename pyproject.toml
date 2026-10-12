@@ -7,12 +7,10 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "pydantic>=2.14.1",
     "pywin32>=312",
     "tzdata>=2026.5",
 ]
-
-[project.scripts]
-outlook-bridge = "outlook_bridge:main"
 
 [build-system]
 requires = ["uv_build>=0.13.0,<0.14.0"]
@@ -34,4 +32,5 @@ select = ["E", "F", "W", "I", "UP", "B"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = ["outlook: needs Windows + a running classic Outlook (real COM)"]
-addopts = "-m 'not outlook'"
+# --tb=short: never dump fixture/argument values, which may hold real mail data (-m outlook).
+addopts = "-m 'not outlook' --tb=short"
