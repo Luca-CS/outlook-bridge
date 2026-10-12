@@ -1,0 +1,26 @@
+# Copy to %APPDATA%\outlook-bridge\config.toml (or point OUTLOOK_BRIDGE_CONFIG at a file).
+# Missing file = these defaults. Unknown keys or invalid values are an explicit error.
+
+timezone = "Europe/Paris"
+
+# display_name of the accounts as returned by list_accounts; empty = all accounts.
+accounts_allowed = []
+
+# Folder names; a folder is excluded if any segment of its path matches (subfolders too).
+folders_excluded = ["Deleted Items", "Junk Email", "Éléments supprimés", "Courrier indésirable"]
+
+# Full addresses ("someone@example.com") or domains ("example.net", subdomains included).
+senders_excluded = []
+
+# Case-insensitive substrings of the subject.
+subject_keywords_excluded = []
+
+# Python regexes; every match is replaced by "[masqué]" in subjects, snippets, bodies, locations.
+# Default: French IBAN.
+redact_patterns = ['\bFR\d{2}(?: ?[0-9A-Z]){23}\b']
+
+# Default for get_mail / get_event (hard cap 20000).
+max_body_chars = 4000
+
+snapshot_dir = ""
+working_hours = "09:00-19:00"
