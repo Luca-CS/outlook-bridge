@@ -11,11 +11,11 @@ import queue
 import re
 import subprocess
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeout
 from datetime import datetime, tzinfo
-from typing import Any, TypeVar
+from typing import Any, NamedTuple, TypeVar
 
 import pythoncom
 import pywintypes
@@ -257,10 +257,42 @@ def _clean_body(text: str | None) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
+def _hex(binary: Any) -> str:
+    """Binary MAPI column (conversation id, long-term EntryID) -> uppercase hex string."""
+    return bytes(binary).hex().upper() if binary else ""
+
+
 def _folder_path(folder: Any) -> str:
     """`\\\\Store\\Boîte de réception\\Sub` -> `Boîte de réception/Sub`."""
     parts = [p for p in str(_get(folder, "FolderPath", "")).split("\\") if p]
     return "/".join(parts[1:])
+
+
+class _Location(NamedTuple):
+    """Store and folder facts, read once per folder rather than once per row or item
+    (each COM property read is a cross-process call)."""
+
+    store_id: str
+    account: str
+    path: str
+
+
+def _location(store: Any, folder: Any) -> _Location:
+    return _Location(str(store.StoreID), str(store.DisplayName), _folder_path(folder))
+
+
+def _table(folder: Any, columns: Sequence[str], flt: str = "") -> Iterator[tuple[Any, ...]]:
+    """Rows of `folder` restricted to `columns`, newest first, capped at SCAN_LIMIT."""
+    table = folder.GetTable(flt) if flt else folder.GetTable()
+    table_columns = table.Columns
+    table_columns.RemoveAll()
+    for name in columns:
+        table_columns.Add(name)
+    table.Sort("ReceivedTime", True)
+    n = 0
+    while not table.EndOfTable and n < SCAN_LIMIT:
+        n += 1
+        yield tuple(table.GetNextRow().GetValues())
 
 
 def _default_folder(store: Any, folder_id: int) -> Any:
@@ -287,6 +319,16 @@ def _resolve_folder(store: Any, path: str) -> Any:
             None,
         )
     return folder
+
+
+def _find_topic(folder: Any, target: str) -> str | None:
+    """Conversation topic of `target`, scanning a slim table (3 columns) newest first."""
+    for conversation, topic, _ in _table(
+        folder, (COL_CONVERSATION, "ConversationTopic", "ReceivedTime")
+    ):
+        if _hex(conversation) == target:
+            return str(topic or "")
+    return None
 
 
 class ComGateway:
@@ -333,13 +375,15 @@ class ComGateway:
         return self._ns
 
     def _stores(self, ns: Any, account: str | None = None) -> Iterator[Any]:
-        smtp_by_store = _smtp_by_store(ns)
+        if not account:
+            yield from _each(ns.Stores)
+            return
+        smtp_by_store = _smtp_by_store(ns)  # only needed to match an account by address
+        wanted = account.casefold()
         for store in _each(ns.Stores):
-            if account:
-                names = {str(store.DisplayName), smtp_by_store.get(str(store.StoreID), "")}
-                if account.casefold() not in {n.casefold() for n in names if n}:
-                    continue
-            yield store
+            names = (str(store.DisplayName), smtp_by_store.get(str(store.StoreID), ""))
+            if wanted in (name.casefold() for name in names):
+                yield store
 
     # ------------------------------------------------------------ status / accounts / folders
 
@@ -418,12 +462,13 @@ class ComGateway:
                 if folder is None:
                     continue
                 resolved += 1
-                rows = self._table_rows(folder, build_dasl_filter(query, self._tz))
+                location = _location(store, folder)
+                rows = _table(folder, MAIL_COLUMNS, build_dasl_filter(query, self._tz))
                 taken = 0
                 for values in rows:
                     if taken >= query.limit:
                         break
-                    mail = self._summary(values, store, folder)
+                    mail = self._summary(values, location)
                     if mail is not None and accept(mail):
                         found.append(mail)
                         taken += 1
@@ -434,19 +479,7 @@ class ComGateway:
 
         return self._call(run)
 
-    def _table_rows(self, folder: Any, flt: str) -> Iterator[tuple[Any, ...]]:
-        table = folder.GetTable(flt) if flt else folder.GetTable()
-        columns = table.Columns
-        columns.RemoveAll()
-        for name in MAIL_COLUMNS:
-            columns.Add(name)
-        table.Sort("ReceivedTime", True)
-        n = 0
-        while not table.EndOfTable and n < SCAN_LIMIT:
-            n += 1
-            yield tuple(table.GetNextRow().GetValues())
-
-    def _summary(self, values: tuple[Any, ...], store: Any, folder: Any) -> MailSummary | None:
+    def _summary(self, values: tuple[Any, ...], location: _Location) -> MailSummary | None:
         def v(name: str) -> Any:
             return values[_COL[name]]
 
@@ -458,12 +491,10 @@ class ComGateway:
         sender_email = v(COL_SENDER_SMTP) or ""
         if not sender_email and v("SenderEmailType") != "EX":
             sender_email = v("SenderEmailAddress") or ""
-        conversation = v(COL_CONVERSATION)
-        longterm = v(COL_LONGTERM_ID)
         return MailSummary(
-            id=bytes(longterm).hex().upper() if longterm else str(v("EntryID")),
-            store_id=str(store.StoreID),
-            conversation_id=bytes(conversation).hex().upper() if conversation else "",
+            id=_hex(v(COL_LONGTERM_ID)) or str(v("EntryID")),
+            store_id=location.store_id,
+            conversation_id=_hex(v(COL_CONVERSATION)),
             subject=str(v("Subject") or ""),
             sender_name=str(v("SenderName") or ""),
             sender_email=str(sender_email),
@@ -472,8 +503,8 @@ class ComGateway:
             unread=bool(v("UnRead")),
             importance=IMPORTANCE.get(_int(v("Importance"), 1), "normal"),
             has_attachments=bool(v(COL_HAS_ATTACH)),
-            folder=_folder_path(folder),
-            account=str(store.DisplayName),
+            folder=location.path,
+            account=location.account,
             snippet=_snippet(v(COL_PREVIEW)),
         )
 
@@ -506,7 +537,7 @@ class ComGateway:
 
     def _detail(self, item: Any, max_chars: int) -> MailDetail:
         folder = item.Parent
-        store = folder.Store
+        location = _location(folder.Store, folder)
         try:
             delivered = item.PropertyAccessor.GetProperty(PR_MESSAGE_DELIVERY_TIME)
             received = to_aware(delivered, utc=True, tz=self._tz)
@@ -528,7 +559,7 @@ class ComGateway:
         ]
         return MailDetail(
             id=str(item.EntryID),
-            store_id=str(store.StoreID),
+            store_id=location.store_id,
             conversation_id=str(_get(item, "ConversationID", "")),
             subject=str(_get(item, "Subject", "")),
             sender_name=str(_get(item, "SenderName", "")),
@@ -539,8 +570,8 @@ class ComGateway:
             unread=bool(_get(item, "UnRead", False)),
             importance=IMPORTANCE.get(_int(_get(item, "Importance"), 1), "normal"),
             has_attachments=bool(attachments),
-            folder=_folder_path(folder),
-            account=str(store.DisplayName),
+            folder=location.path,
+            account=location.account,
             snippet=_snippet(body),
             body_text=body[:max_chars],
             body_truncated=len(body) > max_chars,
@@ -555,45 +586,27 @@ class ComGateway:
 
         def run(ns: Any) -> list[MailSummary]:
             folders = [
-                (store, folder)
+                (folder, _location(store, folder))
                 for store in self._stores(ns)
                 for folder_id in (OL_FOLDER_INBOX, OL_FOLDER_SENT)
                 if (folder := _default_folder(store, folder_id)) is not None
             ]
-            topic = next(
-                (t for _, f in folders if (t := self._find_topic(f, target)) is not None), None
-            )
+            topic = next((t for f, _ in folders if (t := _find_topic(f, target)) is not None), None)
             if topic is None:
                 return []
             flt = f"@SQL=\"{DASL_THREAD_TOPIC}\" = '{topic.replace(chr(39), chr(39) * 2)}'"
             found: list[MailSummary] = []
-            for store, folder in folders:
-                for values in self._table_rows(folder, flt):
-                    conversation = values[_COL[COL_CONVERSATION]]
-                    if not conversation or bytes(conversation).hex().upper() != target:
+            for folder, location in folders:
+                for values in _table(folder, MAIL_COLUMNS, flt):
+                    if _hex(values[_COL[COL_CONVERSATION]]) != target:
                         continue
-                    mail = self._summary(values, store, folder)
+                    mail = self._summary(values, location)
                     if mail is not None and accept(mail):
                         found.append(mail)
             found.sort(key=lambda m: m.received)
             return found[-limit:]
 
         return self._call(run)
-
-    def _find_topic(self, folder: Any, target: str) -> str | None:
-        table = folder.GetTable()
-        columns = table.Columns
-        columns.RemoveAll()
-        for name in (COL_CONVERSATION, "ConversationTopic", "ReceivedTime"):
-            columns.Add(name)
-        table.Sort("ReceivedTime", True)
-        n = 0
-        while not table.EndOfTable and n < SCAN_LIMIT:
-            n += 1
-            conversation, topic, _ = table.GetNextRow().GetValues()
-            if conversation and bytes(conversation).hex().upper() == target:
-                return str(topic or "")
-        return None
 
     # ------------------------------------------------------------ calendar
 
@@ -607,17 +620,17 @@ class ComGateway:
             for store in self._stores(ns):
                 root = _default_folder(store, OL_FOLDER_CALENDAR)
                 for folder in self._calendars(root, 0):
-                    path = _folder_path(folder)
+                    location = _location(store, folder)
                     if calendar and calendar.casefold() not in (
                         str(folder.Name).casefold(),
-                        path.casefold(),
+                        location.path.casefold(),
                     ):
                         continue
                     items = folder.Items
                     items.Sort("[Start]")
                     items.IncludeRecurrences = True
                     for item in _iter_items(items.Restrict(flt), EVENTS_LIMIT):
-                        event = self._event(item, store, path, max_chars=None)
+                        event = self._event(item, location, max_chars=None)
                         if event is not None and accept(event):
                             events.append(event)
             events.sort(key=lambda e: e.start)
@@ -633,14 +646,14 @@ class ComGateway:
         for sub in _each(folder.Folders):
             yield from self._calendars(sub, depth + 1)
 
-    def _event(self, item: Any, store: Any, path: str, max_chars: int | None) -> Event | None:
+    def _event(self, item: Any, location: _Location, max_chars: int | None) -> Event | None:
         if _get(item, "Class") != OL_CLASS_APPOINTMENT:
             return None
         start = to_aware(_get(item, "StartUTC"), utc=True, tz=self._tz)
         end = to_aware(_get(item, "EndUTC"), utc=True, tz=self._tz)
         if start is None or end is None:
             return None
-        location = str(_get(item, "Location", ""))
+        venue = str(_get(item, "Location", ""))
         body = None
         truncated = False
         if max_chars is not None:
@@ -648,21 +661,21 @@ class ComGateway:
             body, truncated = full[:max_chars], len(full) > max_chars
         return Event(
             id=str(item.EntryID),
-            store_id=str(store.StoreID),
-            calendar=path,
-            account=str(store.DisplayName),
+            store_id=location.store_id,
+            calendar=location.path,
+            account=location.account,
             subject=str(_get(item, "Subject", "")),
             start=start,
             end=end,
             all_day=bool(_get(item, "AllDayEvent", False)),
-            location=location,
+            location=venue,
             organizer=str(_get(item, "Organizer", "")),
             required_attendees=_split_names(_get(item, "RequiredAttendees")),
             optional_attendees=_split_names(_get(item, "OptionalAttendees")),
             busy_status=BUSY.get(int(_get(item, "BusyStatus", 2)), "busy"),
             is_recurring=bool(_get(item, "IsRecurring", False)),
             response_status=RESPONSE.get(int(_get(item, "ResponseStatus", 0)), "none"),
-            online_meeting_url=find_meeting_url(location, body),
+            online_meeting_url=find_meeting_url(venue, body),
             body_text=body,
             body_truncated=truncated,
         )
@@ -685,6 +698,6 @@ class ComGateway:
                 except pywintypes.com_error:
                     return None
             folder = _parent_folder(item)
-            return self._event(item, folder.Store, _folder_path(folder), max_chars)
+            return self._event(item, _location(folder.Store, folder), max_chars)
 
         return self._call(run)

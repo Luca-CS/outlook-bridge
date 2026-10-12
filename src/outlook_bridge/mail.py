@@ -4,17 +4,14 @@ from __future__ import annotations
 
 from datetime import datetime, tzinfo
 
-from outlook_bridge.config import MAX_BODY_CHARS_LIMIT, Config
+from outlook_bridge.config import Config
 from outlook_bridge.errors import InvalidRequest, NotFound
 from outlook_bridge.gateway import MailQuery, OutlookGateway
 from outlook_bridge.models import MailDetail, MailSummary
-from outlook_bridge.redact import Policy
+from outlook_bridge.redact import REDACT_MARGIN, Policy, body_limit, clip_body
 from outlook_bridge.timeutil import dasl_datetime, ensure_aware
 
 MAX_LIMIT = 100
-MAX_THREAD_LIMIT = 100
-# Extra body characters fetched so that a pattern cut by truncation is still redacted.
-REDACT_MARGIN = 200
 
 DASL_RECEIVED = "urn:schemas:httpmail:datereceived"
 DASL_READ = "urn:schemas:httpmail:read"
@@ -49,6 +46,12 @@ def build_dasl_filter(query: MailQuery, tz: tzinfo) -> str:
     return "@SQL=" + " AND ".join(parts) if parts else ""
 
 
+def _check_limit(limit: int) -> int:
+    if limit < 1:
+        raise InvalidRequest("limit doit être ≥ 1.")
+    return min(limit, MAX_LIMIT)
+
+
 class MailService:
     def __init__(self, gateway: OutlookGateway, config: Config, policy: Policy) -> None:
         self._gw = gateway
@@ -66,9 +69,7 @@ class MailService:
         unread_only: bool = False,
         limit: int = 25,
     ) -> list[MailSummary]:
-        if limit < 1:
-            raise InvalidRequest("limit doit être ≥ 1.")
-        limit = min(limit, MAX_LIMIT)
+        limit = _check_limit(limit)
         tz = self._config.tz
         since = ensure_aware(since, tz) if since else None
         until = ensure_aware(until, tz) if until else None
@@ -90,18 +91,14 @@ class MailService:
         return [self._policy.redact_mail(m) for m in found[:limit]]
 
     def get_mail(self, id: str, store_id: str, max_chars: int | None = None) -> MailDetail:
-        max_chars = max(1, min(max_chars or self._config.max_body_chars, MAX_BODY_CHARS_LIMIT))
+        max_chars = body_limit(max_chars, self._config.max_body_chars)
         mail = self._gw.get_mail(id, store_id, max_chars + REDACT_MARGIN)
         if mail is None or not self._policy.mail_visible(mail):
             raise NotFound("Mail")
         mail = self._policy.redact_mail(mail)
-        body = mail.body_text
-        truncated = mail.body_truncated or len(body) > max_chars
-        return mail.model_copy(update={"body_text": body[:max_chars], "body_truncated": truncated})
+        return mail.model_copy(update=clip_body(mail.body_text, mail.body_truncated, max_chars))
 
     def get_thread(self, conversation_id: str, limit: int = 20) -> list[MailSummary]:
-        if limit < 1:
-            raise InvalidRequest("limit doit être ≥ 1.")
-        limit = min(limit, MAX_THREAD_LIMIT)
+        limit = _check_limit(limit)
         found = self._gw.get_thread(conversation_id, limit, self._policy.mail_visible)
         return [self._policy.redact_mail(m) for m in found[-limit:]]

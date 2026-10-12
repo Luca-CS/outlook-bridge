@@ -9,11 +9,25 @@ from __future__ import annotations
 import re
 from typing import TypeVar
 
-from outlook_bridge.config import Config
+from outlook_bridge.config import MAX_BODY_CHARS_LIMIT, Config
 from outlook_bridge.models import Event, MailDetail, MailSummary
 
 REDACTED = "[masqué]"
 SNIPPET_MAX = 200
+# Extra body characters fetched from Outlook so that a pattern cut by truncation is still
+# redacted: bodies are redacted first, then clipped (`clip_body`).
+REDACT_MARGIN = 200
+
+
+def body_limit(requested: int | None, default: int) -> int:
+    """`max_chars` asked by the caller, defaulting to the config, capped at the hard limit."""
+    return max(1, min(requested or default, MAX_BODY_CHARS_LIMIT))
+
+
+def clip_body(body: str, truncated: bool, max_chars: int) -> dict[str, str | bool]:
+    """`model_copy` update truncating an already-redacted body to `max_chars`."""
+    return {"body_text": body[:max_chars], "body_truncated": truncated or len(body) > max_chars}
+
 
 M = TypeVar("M", MailSummary, MailDetail)
 

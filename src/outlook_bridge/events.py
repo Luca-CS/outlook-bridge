@@ -6,15 +6,14 @@ import re
 from collections.abc import Iterable
 from datetime import datetime, time, timedelta, tzinfo
 
-from outlook_bridge.config import MAX_BODY_CHARS_LIMIT, Config
+from outlook_bridge.config import Config
 from outlook_bridge.errors import InvalidRequest, NotFound
 from outlook_bridge.gateway import OutlookGateway
 from outlook_bridge.models import Event, FreeSlot
-from outlook_bridge.redact import Policy
+from outlook_bridge.redact import REDACT_MARGIN, Policy, body_limit, clip_body
 from outlook_bridge.timeutil import ensure_aware, jet_datetime, parse_working_hours
 
 MAX_RANGE_DAYS = 62
-REDACT_MARGIN = 200
 
 _MEETING_URL = re.compile(
     r"https://(?:"
@@ -137,15 +136,15 @@ class CalendarService:
         start: datetime | None = None,
     ) -> Event:
         tz = self._config.tz
-        max_chars = max(1, min(max_chars or self._config.max_body_chars, MAX_BODY_CHARS_LIMIT))
+        max_chars = body_limit(max_chars, self._config.max_body_chars)
         occurrence = ensure_aware(start, tz) if start else None
         event = self._gw.get_event(id, store_id, max_chars + REDACT_MARGIN, occurrence)
         if event is None or not self._policy.event_visible(event):
             raise NotFound("Événement")
         event = self._policy.redact_event(event)
-        body = event.body_text or ""
-        truncated = event.body_truncated or len(body) > max_chars
-        return event.model_copy(update={"body_text": body[:max_chars], "body_truncated": truncated})
+        return event.model_copy(
+            update=clip_body(event.body_text or "", event.body_truncated, max_chars)
+        )
 
     def find_free_slots(
         self,
