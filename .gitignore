@@ -1,0 +1,54 @@
+# Python / uv
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Secrets and local config — never commit
+.env
+.env.*
+config.toml
+!config.example.toml
+*.local.toml
+
+# Real Outlook data — never commit
+*.pst
+*.ost
+*.msg
+*.eml
+*.ics
+logs/
+*.log
+snapshots/
+exports/
+spike_output*
+scripts/*.out
+scripts/*.json
+
+# Screenshots / local captures
+*.png
+*.jpg
+*.jpeg
+!docs/img/*.png
+
+# MCPB build output
+*.mcpb
+mcpb/server/lib/
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# OS / editors
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/
