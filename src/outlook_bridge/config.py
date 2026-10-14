@@ -11,10 +11,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from outlook_bridge.errors import InvalidRequest, OutlookBridgeError
+from outlook_bridge.errors import ConfigError, InvalidRequest
 from outlook_bridge.timeutil import parse_working_hours
 
 ENV_CONFIG = "OUTLOOK_BRIDGE_CONFIG"
+ENV_DATA_DIR = "OUTLOOK_BRIDGE_DATA_DIR"
 MAX_BODY_CHARS_LIMIT = 20000
 
 
@@ -79,6 +80,22 @@ def config_path() -> Path:
     return Path(appdata) / "outlook-bridge" / "config.toml"
 
 
+def data_dir() -> Path:
+    """Local, per-machine data (audit log, CLI state): %LOCALAPPDATA%\\outlook-bridge."""
+    if override := os.environ.get(ENV_DATA_DIR):
+        return Path(override)
+    local = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    return Path(local) / "outlook-bridge"
+
+
+def log_dir() -> Path:
+    return data_dir() / "logs"
+
+
+def state_dir() -> Path:
+    return data_dir() / "state"
+
+
 def load_config(path: Path | None = None) -> Config:
     """Missing file = defaults. Invalid file = explicit error (never silently ignored)."""
     path = path or config_path()
@@ -88,4 +105,4 @@ def load_config(path: Path | None = None) -> Config:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
         return Config.model_validate(data)
     except (tomllib.TOMLDecodeError, ValidationError) as exc:
-        raise OutlookBridgeError(f"Configuration invalide ({path}) : {exc}") from exc
+        raise ConfigError(f"Configuration invalide ({path}) : {exc}") from exc

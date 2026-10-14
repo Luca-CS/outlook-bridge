@@ -100,3 +100,74 @@ class Status(_Model):
     accounts: list[Account] = Field(default_factory=list)
     last_access: AwareDatetime | None = None
     message: str | None = None
+
+
+# ---------------------------------------------------------------------------- snapshots
+# The snapshot files land in a cloud-synced folder: their event model is an explicit
+# allow-list, so a field added to `Event` later never reaches the cloud by default. No ID,
+# no store ID, no body and no meeting URL (only whether there is one).
+
+
+class SnapshotEvent(_Model):
+    untrusted_content: Literal[True] = True
+    subject: str
+    start: AwareDatetime
+    end: AwareDatetime
+    all_day: bool
+    location: str
+    organizer: str
+    required_attendees: list[str]
+    optional_attendees: list[str]
+    busy_status: BusyStatus
+    response_status: ResponseStatus
+    is_recurring: bool
+    has_online_meeting: bool
+    calendar: str
+    account: str
+
+    @classmethod
+    def from_event(cls, event: Event) -> SnapshotEvent:
+        """Field-by-field copy of the allowed fields (never `model_dump` of the source)."""
+        return cls(
+            subject=event.subject,
+            start=event.start,
+            end=event.end,
+            all_day=event.all_day,
+            location=event.location,
+            organizer=event.organizer,
+            required_attendees=list(event.required_attendees),
+            optional_attendees=list(event.optional_attendees),
+            busy_status=event.busy_status,
+            response_status=event.response_status,
+            is_recurring=event.is_recurring,
+            has_online_meeting=bool(event.online_meeting_url),
+            calendar=event.calendar,
+            account=event.account,
+        )
+
+
+class CalendarSnapshot(_Model):
+    snapshot: Literal["calendar_next14d"] = "calendar_next14d"
+    schema_version: Literal[1] = 1
+    generated_at: AwareDatetime
+    timezone: str
+    range_start: AwareDatetime
+    range_end: AwareDatetime
+    untrusted_content: Literal[True] = True
+    notice: str
+    events: list[SnapshotEvent]
+    free_slots: list[FreeSlot]
+    free_slots_min_duration_min: int
+    working_hours: str
+
+
+class ExportedFile(_Model):
+    name: str
+    summary: str
+    size_bytes: int
+
+
+class ExportResult(_Model):
+    out_dir: str
+    generated_at: AwareDatetime
+    files: list[ExportedFile]

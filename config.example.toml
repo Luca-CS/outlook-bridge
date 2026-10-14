@@ -22,5 +22,7 @@ redact_patterns = ['\bFR\d{2}(?: ?[0-9A-Z]){23}\b']
 # Default for get_mail / get_event (hard cap 20000).
 max_body_chars = 4000
 
+# Absolute path of the synced folder for `outlook-bridge export` (Drive, OneDrive...). Use a TOML
+# literal string (single quotes) so backslashes are kept: snapshot_dir = 'G:\Drive\outlook-bridge'
 snapshot_dir = ""
 working_hours = "09:00-19:00"
