@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import locale
 import re
+import time
 from datetime import UTC, date, datetime, timedelta
+from html import unescape as html_unescape
 from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -119,9 +121,27 @@ def test_clean_line_cuts_with_ascii_ellipsis():
     assert clean_line("abcdef", 2) == "ab"
 
 
-def test_clean_line_is_linear_on_hostile_input():
-    out = clean_line("\x9d" * 20000 + "\x1b]" * 20000 + "fin")
+# Introducers of the string sequences (OSC, DCS, SOS, PM, APC), C1 and ESC forms.
+INTRODUCERS = ["\x9d", "\x90", "\x98", "\x9e", "\x9f", "\x1b]", "\x1bP", "\x1bX", "\x1b^", "\x1b_"]
+
+
+def _timed(clean, text: str) -> tuple[str, float]:
+    start = time.perf_counter()
+    out = clean(text)
+    return out, time.perf_counter() - start
+
+
+@pytest.mark.parametrize("clean", [clean_line, clean_block], ids=["line", "block"])
+@pytest.mark.parametrize("intro", INTRODUCERS, ids=lambda s: s.encode("unicode_escape").decode())
+def test_cleaning_is_linear_on_hostile_input(clean, intro: str):
+    """A body (up to max_body_chars) full of unterminated sequences: linear is ~10 ms here,
+    a backtracking regex takes seconds. The bound leaves a wide margin for a slow machine."""
+    out, elapsed = _timed(clean, intro * 20000 + "fin")
     assert out.endswith("fin")
+    assert elapsed < 1.0
+    out, elapsed = _timed(clean, "\x9d" * 20000 + "\x1b]" * 20000 + "fin")
+    assert out.endswith("fin")
+    assert elapsed < 1.0
 
 
 # ---------------------------------------------------------------------------- clean_block
@@ -158,6 +178,29 @@ def test_md_inline_escapes_markdown_specials():
     assert md_inline(None) == ""
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("# Instructions", r"\# Instructions"),
+        ("  ## Titre", r"\## Titre"),  # clean_line strips the indent first
+        ("- x", r"\- x"),
+        ("+ x", r"\+ x"),
+        ("---", r"\---"),
+        ("===", r"\==="),
+        ("~~~ py", r"\~~~ py"),
+        ("1. étape", r"1\. étape"),
+        ("12) étape", r"12\) étape"),
+        ("> cité", r"\> cité"),
+        ("Point #3 - a + b = c", "Point #3 - a + b = c"),  # only a leading marker
+        ("2026-10-12 1.5", "2026-10-12 1.5"),
+        ("a & b", "a &amp; b"),
+        ("&#x202E;fdp.exe", "&amp;#x202E;fdp.exe"),
+    ],
+)
+def test_md_inline_neutralises_block_markers_and_entities(raw: str, expected: str):
+    assert md_inline(raw) == expected
+
+
 def test_md_inline_cuts_before_escaping():
     assert md_inline("*" * 10, 5) == r"\*\*..."
     assert md_inline("ab\\cdefgh", 6) == r"ab\\..."  # the backslash stays escaped
@@ -170,15 +213,30 @@ def _tags(html: str) -> set[str]:
 ALLOWED_TAGS = {"p", "ul", "li", "strong", "blockquote"}
 
 
-@pytest.mark.parametrize("raw", [HOSTILE_MD, "<script>alert(1)</script>", "**gras** _it_ x\ny"])
+BLOCK_STARTS = ["# x", "## x", "1. x", "1) x", "- x", "+ x", "---", "===", "~~~", "> x"]
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        HOSTILE_MD,
+        "<script>alert(1)</script>",
+        "**gras** _it_ x\ny",
+        *BLOCK_STARTS,
+        "&#x202E;fdp.exe",
+        "Facture &#8238;fdp &lt;b&gt; &amp;",
+    ],
+)
 def test_md_inline_renders_inert(raw: str):
     markdown_it = pytest.importorskip("markdown_it")
     md = markdown_it.MarkdownIt("commonmark", {"html": True}).enable("table")
     out = md_inline(raw)
     assert "\n" not in out
-    for doc in (out, f"- 12:00 · **{out}** · ok", f"  > {out}"):
+    contexts = (out, f"- 12:00 · **{out}** · ok", f"  > {out}", f"- ligne\n  > {out}", f"t\n{out}")
+    for doc in contexts:
         html = md.render(doc)
         assert "<img" not in html and "<a" not in html and "<script" not in html
+        assert "‮" not in html and "<b>" not in html  # no entity was decoded
         assert _tags(html) <= {f"<{t}>" for t in ALLOWED_TAGS} | {f"</{t}>" for t in ALLOWED_TAGS}
     cell = md.render(f"| a | b |\n|---|---|\n| {out} | x |")
     assert cell.count("<td>") == 2  # the pipe did not open a new column
@@ -190,6 +248,10 @@ def test_md_inline_round_trips_text():
     html = md.render(md_inline(HOSTILE_MD))
     assert "[lien](https://example.com)" in html
     assert "&lt;img src=x&gt;" in html
+    for raw in [*BLOCK_STARTS, "&#x202E;fdp.exe", "a & b", "Point #3"]:
+        rendered = md.render(f"  > {md_inline(raw)}")
+        text = re.sub(r"<[^>]+>", "", rendered).strip()
+        assert html_unescape(text) == raw  # the reader sees the original text
 
 
 # ---------------------------------------------------------------------------- date labels
@@ -332,18 +394,46 @@ def agenda_events() -> list[Event]:
     ]
 
 
-def test_group_by_day_lists_every_day_and_each_event_once():
+def test_group_by_day_lists_every_day_with_the_events_covering_it():
     events = agenda_events()
     days = group_by_day(events, at(12), at(26), PARIS)
     assert [d for d, _ in days] == [MONDAY + timedelta(days=i) for i in range(14)]
     by_day = {d: [e.id for e in evs] for d, evs in days}
     assert by_day[MONDAY] == ["EVT-2", "EVT-6", "EVT-1"]  # sorted, started-before first
     assert by_day[date(2026, 10, 13)] == []
+    # a 3-day all-day event is under each of its days, not only the first one
     assert by_day[date(2026, 10, 14)] == ["EVT-3"]
-    assert by_day[date(2026, 10, 15)] == [] and by_day[date(2026, 10, 16)] == ["EVT-4"]
-    assert by_day[date(2026, 10, 25)] == ["EVT-5"]
-    listed = [e.id for _, evs in days for e in evs]
-    assert sorted(listed) == ["EVT-1", "EVT-2", "EVT-3", "EVT-4", "EVT-5", "EVT-6"]
+    assert by_day[date(2026, 10, 15)] == ["EVT-3"]
+    assert by_day[date(2026, 10, 16)] == ["EVT-3", "EVT-4"]
+    assert by_day[date(2026, 10, 17)] == ["EVT-4"]  # crossed midnight
+    assert by_day[date(2026, 10, 18)] == []
+    assert by_day[date(2026, 10, 25)] == ["EVT-5"]  # its last 30 min are after the range
+    listed = {e.id for _, evs in days for e in evs}
+    assert listed == {"EVT-1", "EVT-2", "EVT-3", "EVT-4", "EVT-5", "EVT-6"}
+
+
+def test_group_by_day_never_shows_a_covered_day_as_empty():
+    leave = event(1, at(19), at(24), all_day=True, busy_status="oof", subject="Congés test")
+    on_call = event(2, at(19, 18), at(21, 8), subject="Astreinte test")  # timed, 3 days
+    midnight = event(3, at(22, 23), at(23))  # ends at 00:00: the next day is not touched
+    instant = event(4, at(20, 0), at(20, 0))  # zero length, at midnight
+    days = group_by_day([leave, on_call, midnight, instant], at(19), at(26), PARIS)
+    by_day = {d: [e.id for e in evs] for d, evs in days}
+    assert by_day == {
+        date(2026, 10, 19): ["EVT-1", "EVT-2"],
+        date(2026, 10, 20): ["EVT-1", "EVT-2", "EVT-4"],  # by start: continuations first
+        date(2026, 10, 21): ["EVT-1", "EVT-2"],
+        date(2026, 10, 22): ["EVT-1", "EVT-3"],
+        date(2026, 10, 23): ["EVT-1"],
+        date(2026, 10, 24): [],
+        date(2026, 10, 25): [],
+    }
+    # a range that starts or ends inside the event lists only the days in the range
+    inside = group_by_day([leave], at(21), at(22, 12), PARIS)
+    assert [(d, [e.id for e in evs]) for d, evs in inside] == [
+        (date(2026, 10, 21), ["EVT-1"]),
+        (date(2026, 10, 22), ["EVT-1"]),
+    ]
 
 
 def test_group_by_day_partial_range_and_empty():
@@ -366,14 +456,30 @@ def test_time_span():
     assert time_span(timed, MONDAY, PARIS) == "14:00-15:00"
     crossing = event(5, at(16, 22), at(17, 1))
     assert time_span(crossing, date(2026, 10, 16), PARIS) == "22:00 au sam. 17/10 01:00"
-    before = event(6, at(11, 22), at(12, 1))
-    assert time_span(before, MONDAY, PARIS) == "dim. 11/10 22:00 au 01:00"
-    long = event(7, at(11, 22), at(13, 1))
-    assert time_span(long, MONDAY, PARIS) == "dim. 11/10 22:00 au mar. 13/10 01:00"
     utc = event(
         8, datetime(2026, 10, 12, 12, 0, tzinfo=UTC), datetime(2026, 10, 12, 13, 0, tzinfo=UTC)
     )
     assert time_span(utc, MONDAY, PARIS) == "14:00-15:00"
+    midnight = event(9, at(16, 23), at(17))
+    assert time_span(midnight, date(2026, 10, 16), PARIS) == "23:00 au sam. 17/10 00:00"
+
+
+def test_time_span_marks_the_following_days_as_suite():
+    leave = event(1, at(19), at(24), all_day=True)  # lun. 19/10 to ven. 23/10 included
+    assert time_span(leave, date(2026, 10, 19), PARIS) == "journées jusqu'au ven. 23/10"
+    assert time_span(leave, date(2026, 10, 20), PARIS) == "journées jusqu'au ven. 23/10 (suite)"
+    assert time_span(leave, date(2026, 10, 22), PARIS) == "journées jusqu'au ven. 23/10 (suite)"
+    assert time_span(leave, date(2026, 10, 23), PARIS) == "journée (suite)"
+    crossing = event(2, at(16, 22), at(17, 1))
+    assert time_span(crossing, date(2026, 10, 17), PARIS) == "ven. 16/10 22:00 au 01:00 (suite)"
+    before = event(3, at(11, 22), at(12, 1))  # started before the range
+    assert time_span(before, MONDAY, PARIS) == "dim. 11/10 22:00 au 01:00 (suite)"
+    long = event(4, at(11, 22), at(13, 1))
+    assert time_span(long, MONDAY, PARIS) == "dim. 11/10 22:00 au mar. 13/10 01:00 (suite)"
+    assert time_span(long, date(2026, 10, 13), PARIS) == "dim. 11/10 22:00 au 01:00 (suite)"
+    # across the DST change, seen from the day after
+    dst = event(5, at(24), at(26), all_day=True)
+    assert time_span(dst, date(2026, 10, 25), PARIS) == "journée (suite)"
 
 
 @pytest.mark.parametrize(

@@ -10,13 +10,14 @@ import re
 from typing import TypeVar
 
 from outlook_bridge.config import MAX_BODY_CHARS_LIMIT, Config
-from outlook_bridge.models import Event, MailDetail, MailSummary
+from outlook_bridge.models import REDACT_MARGIN as REDACT_MARGIN
+from outlook_bridge.models import SNIPPET_MAX, Event, MailDetail, MailSummary
 
 REDACTED = "[masqué]"
-SNIPPET_MAX = 200
-# Extra body characters fetched from Outlook so that a pattern cut by truncation is still
-# redacted: bodies are redacted first, then clipped (`clip_body`).
-REDACT_MARGIN = 200
+# SNIPPET_MAX and REDACT_MARGIN live in models (the snippet field bound needs them). Bodies
+# and snippets come from Outlook REDACT_MARGIN characters longer than shown, so that a
+# pattern cut by truncation is still redacted: redact first, then clip (`clip_body`,
+# `redact_mail`).
 
 
 def body_limit(requested: int | None, default: int) -> int:
@@ -98,6 +99,7 @@ class Policy:
     def redact_mail(self, mail: M) -> M:
         update = {
             "subject": self.redact(mail.subject),
+            # The raw snippet is up to SNIPPET_MAX + REDACT_MARGIN long: redact, then clip.
             "snippet": self.redact(mail.snippet)[:SNIPPET_MAX],
         }
         if isinstance(mail, MailDetail):

@@ -17,7 +17,7 @@ Un seul cœur Python (`outlook_bridge.core`) sert trois sorties : CLI (typer), s
 La spec de référence est `OUTLOOK_BRIDGE_SPEC.md`. En cas de doute, c'est elle qui fait foi ; ce fichier n'en est que le condensé.
 
 ## Phase en cours
-**Phase 1 (cœur et tests) terminée, en attente de validation avant la Phase 2.** Constats et écarts : `docs/phase0-report.md`, `docs/phase1-report.md`.
+**Phase 2 (CLI, snapshots, journal d'audit) : décisions validées, revue adversariale corrigée ; en attente de validation avant la Phase 3 (serveur MCP).** Constats et écarts : `docs/phase0-report.md` à `docs/phase2-report.md`.
 Environnement : le `python` en tête du PATH est celui de MSYS2/mingw, incompatible avec pywin32. Toujours passer par `uv run` (CPython de `.python-version`), jamais par le `python` nu. `tzdata` est requis (Windows n'a pas de base IANA).
 Travailler phase par phase (spec §10). À chaque point de contrôle : lancer les tests, résumer ce qui marche et ce qui ne marche pas, **attendre la validation** avant la phase suivante. Faire un commit git en fin de phase (en anglais, conventionnel : `feat:`, `fix:`, `test:`, `docs:`).
 Si une hypothèse de la spec est fausse sur cette machine (version d'Outlook, locale, comportement COM), le signaler et proposer un ajustement plutôt que de contourner en silence.
@@ -28,7 +28,7 @@ uv run pytest                      # tests unitaires (FakeGateway, sans Outlook)
 uv run pytest tests/test_redact.py::test_x   # un seul test
 uv run pytest -m outlook           # intégration : Windows + Outlook réels
 uv run ruff check . && uv run ruff format .
-uv run outlook-bridge status|mails|mail <id>|events|slots|export
+uv run outlook-bridge status|mails|mail <n°>|events|slots|export   # --help ; dates : 2d, +7d, auj, 16/10, 14:00
 uv run outlook-bridge-mcp          # serveur MCP stdio
 uv run mcp dev src/outlook_bridge/mcp_server.py   # inspecteur MCP
 uv run python scripts/spike.py     # Phase 0
@@ -45,6 +45,8 @@ uv run python scripts/spike.py     # Phase 0
 - `src/outlook_bridge/gateway.py` définit le Protocol `OutlookGateway`. **Seul `com_gateway.py` touche COM** (et fait la conversion COM → modèles). Toute la logique (filtres DASL/Jet, créneaux libres, exclusions, rédaction, dates) vit dans `mail.py`, `events.py` (pas `calendar.py` : masquerait le module standard), `redact.py`, `timeutil.py` et se teste sur `tests/fakes.py::FakeGateway`.
 - Les exclusions passent au gateway sous forme de prédicat `accept` pour que `limit` compte les éléments visibles ; la rédaction est faite avant troncature.
 - `core.Bridge` est le point d'entrée unique ; `cli.py`, `mcp_server.py` et `export.py` en sont de fines couches et ne renvoient que des modèles pydantic (`models.py`).
+- Journal d'audit (`audit.py`) : `@audited` sur les 9 méthodes du cœur = outils MCP (§5.2) ; `Bridge.from_environment(source="cli"|"mcp")` le branche, un `Bridge(...)` construit à la main n'écrit rien. Aucun code d'audit dans les frontaux ; jamais de `print(` ni `sys.stdout` hors `cli.py` (canal stdio MCP), vérifié par `tests/test_layering.py`.
+- Tests : une fixture autouse redirige `OUTLOOK_BRIDGE_CONFIG` et `OUTLOOK_BRIDGE_DATA_DIR` vers `tmp_path` ; aucun test ne lit la vraie config ni n'écrit dans le vrai profil.
 - Packaging Desktop en Phase 4 via MCPB (`mcpb/manifest.json`) ; skills en Phase 5 dans `skills/<nom>/SKILL.md`.
 
 ## Pièges COM (spec §7, à traiter explicitement)

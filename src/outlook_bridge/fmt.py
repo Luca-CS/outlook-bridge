@@ -82,6 +82,9 @@ _LINE_BREAKS = re.compile(r"\r\n?|[\x0b\x0c\x85\u2028\u2029]")
 _INLINE_SPACE = re.compile(r"[^\S\n]")
 _BLANK_RUNS = re.compile(r"\n{4,}")
 _MD_SPECIAL = re.compile(r"([\\`*_\[\]<>|])")
+# A line start CommonMark would read as a block (heading, list item, thematic break, setext
+# underline, code fence): the marker is escaped, after the digits of an ordered list marker.
+_MD_BLOCK_START = re.compile(r"^(?:(\d+)(?=[.)])|(?=[#+=~-]))")
 
 
 def _strip_controls(text: str) -> str:
@@ -118,9 +121,15 @@ def clean_block(text: str | None) -> str:
 
 def md_inline(text: str | None, max_len: int | None = None) -> str:
     """Untrusted text for an inline Markdown context: `clean_line`, then the characters that
-    could build a link, an image, raw HTML, code or a table cell are backslash-escaped. The cut
-    happens before escaping, so an escape is never split."""
-    return _MD_SPECIAL.sub(r"\\\1", clean_line(text, max_len))
+    could build a link, an image, raw HTML, code or a table cell are backslash-escaped, `&`
+    becomes `&amp;` (no entity such as `&#x202E;` is ever decoded) and a leading block marker
+    (`#`, `-`, `+`, `=`, `~`, `1.`, `1)`) is escaped, so the text never opens a heading, a list,
+    a rule or a fence, even at the start of a line. The cut happens before escaping, so an
+    escape is never split."""
+    escaped = _MD_SPECIAL.sub(r"\\\1", clean_line(text, max_len).replace("&", "&amp;"))
+    return _MD_BLOCK_START.sub(
+        lambda m: f"{m.group(1)}\\" if m.group(1) else "\\", escaped, count=1
+    )
 
 
 # ---------------------------------------------------------------------------- dates
@@ -275,11 +284,13 @@ class EventLike(Protocol):
 def group_by_day[E: EventLike](
     events: Sequence[E], start: datetime, end: datetime, tz: tzinfo
 ) -> list[tuple[date, list[E]]]:
-    """Every local day touching [start, end), each with its events sorted by start.
+    """Every local day touching [start, end), each with the events covering it, by start.
 
-    An event is listed once: under its local start day, or under the first day when it
-    started before the range. Days without events are kept (empty list), so a reader never
-    mistakes a missing day for a free one. Events outside the range are ignored.
+    An event is listed under every day of the range it covers, from its local start day (or
+    the first day, when it started before the range) to its last local day, so a day taken by
+    a multi-day event never reads as empty; `time_span` marks the following days `(suite)`.
+    Days without events are kept (empty list), so a reader never mistakes a missing day for a
+    free one. Events outside the range are ignored.
     """
     first, last = ensure_aware(start, tz), ensure_aware(end, tz)
     if last <= first:
@@ -293,30 +304,36 @@ def group_by_day[E: EventLike](
         ev_start, ev_end = ensure_aware(event.start, tz), ensure_aware(event.end, tz)
         if ev_start >= last or (ev_start < first and ev_end <= first):
             continue
-        bucket = days.get(max(ev_start.date(), first.date()))
-        if bucket is not None:
-            bucket.append(event)
+        day = max(ev_start.date(), first.date())
+        until = min(_last_day(ev_end) if ev_end > ev_start else ev_start.date(), last_day)
+        while day <= until:
+            if (bucket := days.get(day)) is not None:
+                bucket.append(event)
+            day += timedelta(days=1)
     return list(days.items())
 
 
 def time_span(event: EventLike, day: date, tz: tzinfo) -> str:
-    """When an event happens, seen from the day it is listed under.
+    """When an event happens, seen from a day it is listed under.
 
     All-day: `journée` or `journées jusqu'au mer. 14/10`. Timed on that day: `14:00-15:00`.
-    Otherwise each end that falls on another day carries its date: `22:00 au sam. 17/10 01:00`,
-    `dim. 11/10 22:00 au 01:00`.
+    Otherwise each end that falls on another day carries its date: `22:00 au sam. 17/10 01:00`.
+    On a day after its start day (multi-day event, or one that began before the range), the
+    span ends with `(suite)`: `journée (suite)`, `journées jusqu'au ven. 23/10 (suite)`,
+    `ven. 16/10 22:00 au 01:00 (suite)`.
     """
     ev_start, ev_end = ensure_aware(event.start, tz), ensure_aware(event.end, tz)
+    suite = " (suite)" if day > ev_start.date() else ""
     if event.all_day:
         last = _last_day(ev_end)
-        if last <= ev_start.date():
-            return "journée"
-        return f"journées jusqu'au {short_day(last)}"
+        if last <= max(day, ev_start.date()):
+            return f"journée{suite}"
+        return f"journées jusqu'au {short_day(last)}{suite}"
     if ev_start.date() == day == ev_end.date():
         return f"{_hm(ev_start)}-{_hm(ev_end)}"
     begin = _hm(ev_start) if ev_start.date() == day else short_dt(ev_start, tz)
     finish = _hm(ev_end) if ev_end.date() == day else short_dt(ev_end, tz)
-    return f"{begin} au {finish}"
+    return f"{begin} au {finish}{suite}"
 
 
 def event_flags(event: EventLike) -> list[str]:

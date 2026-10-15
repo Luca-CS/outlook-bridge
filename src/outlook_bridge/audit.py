@@ -17,6 +17,7 @@ import functools
 import hashlib
 import inspect
 import json
+import os
 import re
 import secrets
 import sys
@@ -28,6 +29,11 @@ from pathlib import Path
 from typing import Protocol
 
 from outlook_bridge.timeutil import ensure_aware
+
+try:  # Windows: a byte-range lock serialises appends across processes
+    import msvcrt
+except ImportError:  # elsewhere a single O_APPEND write is already atomic
+    msvcrt = None
 
 Clock = Callable[[], datetime]  # returns an aware datetime in config.tz
 
@@ -58,10 +64,19 @@ WELL_KNOWN_NAMES = frozenset(  # casefolded
     }
 )
 _HOURS = re.compile(r"^\d{2}:\d{2}-\d{2}:\d{2}$")
+# One byte far past the end of any monthly file, locked as a cross-process mutex: readers of
+# the log are never blocked, and the CRT append still writes at the real end of the file.
+_LOCK_OFFSET = 0x7FFF0000
+_LOCK_WAIT_S = 2.0
 
 
 def fingerprint(value: str) -> str:
-    """Short, stable, non-reversible tag for an ID or a personal name: `#` + 10 hex chars."""
+    """Short, stable pseudonymous tag for an ID or a personal name: `#` + 10 hex chars.
+
+    Unsalted sha256: it hides the raw value, but anyone holding the log can confirm a guess
+    for a known short name (folder, address); long EntryIDs stay out of reach. Acceptable
+    because the log stays local and is never exported.
+    """
     return "#" + hashlib.sha256(value.encode("utf-8")).hexdigest()[:10]
 
 
@@ -125,27 +140,61 @@ class NullSink:
 
 
 class JsonlSink:
-    """Monthly JSON Lines files `audit-YYYY-MM.jsonl`, one write per record, thread-safe."""
+    """Monthly JSON Lines files `audit-YYYY-MM.jsonl`, one write per record.
+
+    Thread-safe, and process-safe on Windows: the MCP server, a scheduled export and a manual
+    CLI may append to the same file at once. A CRT append is seek-to-end then write, so without
+    the cross-process lock one record could silently overwrite another.
+    """
 
     def __init__(self, directory: Path) -> None:
         self.directory = directory
         self._lock = threading.Lock()
         self._warned = False
+        self._locking = msvcrt is not None  # off after a timeout: unserialised, never stuck
 
     def path_for(self, when: datetime) -> Path:
         return self.directory / f"audit-{when:%Y-%m}.jsonl"
 
     def write(self, record: dict[str, object], when: datetime) -> None:
         line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+        data = line.encode("utf-8")
         with self._lock:
             try:
                 self.directory.mkdir(parents=True, exist_ok=True)
-                with self.path_for(when).open("a", encoding="utf-8", newline="\n") as fh:
-                    fh.write(line)
+                with self.path_for(when).open("ab", buffering=0) as fh:
+                    locked = self._lock_file(fh.fileno())
+                    try:
+                        fh.write(data)  # a single write: the CRT appends at the current end
+                    finally:
+                        if locked:
+                            _unlock_file(fh.fileno())
             except OSError as exc:
                 if not self._warned:
                     self._warned = True
                     _warn(exc)
+
+    def _lock_file(self, fd: int) -> bool:
+        """Waits for the cross-process lock; False = write unlocked (fail-open)."""
+        if not self._locking:
+            return False
+        deadline = time.monotonic() + _LOCK_WAIT_S
+        while True:
+            try:
+                os.lseek(fd, _LOCK_OFFSET, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                return True
+            except OSError:
+                if time.monotonic() >= deadline:
+                    self._locking = False
+                    return False
+                time.sleep(0.001)
+
+
+def _unlock_file(fd: int) -> None:
+    with contextlib.suppress(OSError):
+        os.lseek(fd, _LOCK_OFFSET, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
 
 
 class Auditor:
@@ -220,7 +269,8 @@ class Auditor:
 def audited[**P, R](fn: Callable[P, R]) -> Callable[P, R]:
     """Audits a method of an object holding `self._audit: Auditor`; tool name = method name.
 
-    Parameters are the bound arguments with defaults applied, minus `self`.
+    Parameters are the bound arguments with defaults applied, minus `self`. The wrapper
+    carries the real signature itself, for front ends that introspect it (FastMCP, typer).
     """
     signature = inspect.signature(fn)
     tool = fn.__name__
@@ -232,4 +282,5 @@ def audited[**P, R](fn: Callable[P, R]) -> Callable[P, R]:
         auditor: Auditor = args[0]._audit  # type: ignore[attr-defined]
         return auditor.call(tool, bound.arguments, lambda: fn(*args, **kwargs))
 
+    wrapper.__signature__ = signature  # type: ignore[attr-defined]
     return wrapper

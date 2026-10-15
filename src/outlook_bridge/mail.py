@@ -8,8 +8,8 @@ from outlook_bridge.audit import Auditor, audited
 from outlook_bridge.config import Config
 from outlook_bridge.errors import InvalidRequest, NotFound
 from outlook_bridge.gateway import MailQuery, OutlookGateway
-from outlook_bridge.models import MailDetail, MailSummary
-from outlook_bridge.redact import REDACT_MARGIN, Policy, body_limit, clip_body
+from outlook_bridge.models import REDACT_MARGIN, MailDetail, MailSummary
+from outlook_bridge.redact import Policy, body_limit, clip_body
 from outlook_bridge.timeutil import dasl_datetime, ensure_aware
 
 MAX_LIMIT = 100
@@ -45,6 +45,12 @@ def build_dasl_filter(query: MailQuery, tz: tzinfo) -> str:
         fields = (DASL_SUBJECT, DASL_BODY)
         parts.append("(" + " OR ".join(f"\"{f}\" LIKE '%{s}%'" for f in fields) + ")")
     return "@SQL=" + " AND ".join(parts) if parts else ""
+
+
+def folder_not_found(folder: str) -> NotFound:
+    """The one error for a folder that is missing (gateway) or excluded (core): both read the
+    same, so `--folder` cannot be used to probe `folders_excluded`."""
+    return NotFound(f"Dossier « {folder} »")
 
 
 def _check_limit(limit: int) -> int:
@@ -85,7 +91,7 @@ class MailService:
         if since and until and since >= until:
             raise InvalidRequest("since doit précéder until.")
         if self._policy.folder_excluded(folder):
-            raise NotFound("Dossier")
+            raise folder_not_found(folder)  # word for word what the gateway says if missing
         mail_query = MailQuery(
             folder=folder,
             account=account,

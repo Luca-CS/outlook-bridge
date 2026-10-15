@@ -7,6 +7,7 @@ from outlook_bridge.core import Bridge
 from outlook_bridge.errors import InvalidRequest, NotFound
 from outlook_bridge.gateway import MailQuery
 from outlook_bridge.mail import build_dasl_filter
+from outlook_bridge.models import SNIPPET_MAX
 from outlook_bridge.redact import REDACTED
 from tests.fakes import NOW, PARIS, STORE, FakeGateway, make_mail
 
@@ -65,14 +66,48 @@ def test_since_after_until_is_rejected():
 
 
 def test_excluded_folder_is_refused():
-    bridge, _ = bridge_with([])
-    with pytest.raises(NotFound):
+    bridge, gw = bridge_with([])
+    with pytest.raises(NotFound, match="^Dossier « Junk Email » introuvable[.]$"):
         bridge.mail.search_mail(folder="Junk Email")
+    assert gw.calls == []
+
+
+def test_excluded_folder_reads_like_a_missing_one():
+    """`--folder` must not reveal `folders_excluded`: an excluded folder and a folder that
+    does not exist (the gateway's NotFound) give the same error, word for word."""
+    name = "Archives test"
+    present = FakeGateway(mails=[make_mail(1), make_mail(2, folder=name)], strict_folders=True)
+    excluded = Bridge(present, Config(folders_excluded=[name]))
+    with pytest.raises(NotFound) as hidden:
+        excluded.mail.search_mail(folder=name)
+    absent = FakeGateway(mails=[make_mail(1)], strict_folders=True)
+    with pytest.raises(NotFound) as missing:
+        Bridge(absent, Config()).mail.search_mail(folder=name)
+    assert type(hidden.value) is type(missing.value)
+    assert str(hidden.value) == str(missing.value) == f"Dossier « {name} » introuvable."
 
 
 def test_search_results_are_redacted():
     bridge, _ = bridge_with([make_mail(1, subject="RIB FR1234567890123456789012345")])
     assert bridge.mail.search_mail()[0].subject == f"RIB {REDACTED}"
+
+
+def test_iban_straddling_the_snippet_cut_is_masked_whole():
+    """The gateway hands over SNIPPET_MAX + REDACT_MARGIN characters of preview: an IBAN
+    crossing character 200 is redacted before the clip, never shown as a fragment."""
+    iban = "FR12 3456 7890 1234 5678 9012 345"  # invented, IBAN-shaped
+    raw = "y" * 189 + " " + iban + " fin"  # the IBAN spans characters 190 to 222
+    assert len(raw) > SNIPPET_MAX
+    bridge, _ = bridge_with([make_mail(1, conversation_id="C", snippet=raw)])
+    snippets = [
+        bridge.mail.search_mail()[0].snippet,
+        bridge.mail.get_mail("MAIL-1", STORE).snippet,
+        bridge.mail.get_thread("C")[0].snippet,
+    ]
+    for snippet in snippets:
+        assert len(snippet) <= SNIPPET_MAX
+        assert not any(char.isdigit() for char in snippet)  # no IBAN group survives
+        assert snippet == ("y" * 189 + " " + REDACTED + " fin")[:SNIPPET_MAX]
 
 
 def test_get_mail_truncates_body():

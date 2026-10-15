@@ -203,6 +203,119 @@ def test_day_month_tie_is_really_a_tie():
     assert (today - date(2027, 3, 1)).days == (date(2028, 3, 1) - today).days == 183
 
 
+# --- DD/MM --to resolved around the start of the range (`after`) ----------------------------
+
+
+def span(first: str, last: str, now: datetime = NOW) -> tuple[str, str]:
+    """(--from, --to) as the CLI resolves them: --to around the resolved --from."""
+    start = parse_when(first, "from", now=now)
+    end = parse_when(last, "to", now=now, after=start)
+    return start.isoformat(timespec="minutes"), end.isoformat(timespec="minutes")
+
+
+@pytest.mark.parametrize(
+    ("now", "first", "last", "expected"),
+    [
+        # 12/10/2026: 01/04 alone is next April (171 days ahead), 30/04 alone last April
+        # (165 days back); as a range both are the same April.
+        (NOW, "01/04", "30/04", ("2027-04-01T00:00+02:00", "2027-05-01T00:00+02:00")),
+        (NOW, "10/04 14h", "14/04", ("2027-04-10T14:00+02:00", "2027-04-15T00:00+02:00")),
+        (NOW, "01/04", "30/04 18:00", ("2027-04-01T00:00+02:00", "2027-04-30T18:00+02:00")),
+        # across New Year, typed before it, on New Year's Eve and after it
+        (NOW, "20/12", "05/01", ("2026-12-20T00:00+01:00", "2027-01-06T00:00+01:00")),
+        (
+            paris(2026, 12, 31, 18),
+            "31/12 22h",
+            "01/01 02h",
+            ("2026-12-31T22:00+01:00", "2027-01-01T02:00+01:00"),
+        ),
+        (
+            paris(2027, 1, 2, 9),
+            "20/12",
+            "05/01",
+            ("2026-12-20T00:00+01:00", "2027-01-06T00:00+01:00"),
+        ),
+        (
+            paris(2027, 1, 2, 9),
+            "-20d",
+            "31/12",
+            ("2026-12-13T00:00+01:00", "2027-01-01T00:00+01:00"),
+        ),
+        # a full-year start keeps working with a yearless end
+        (NOW, "28/12/2026", "03/01", ("2026-12-28T00:00+01:00", "2027-01-04T00:00+01:00")),
+        (NOW, "today", "16/10", ("2026-10-12T00:00+02:00", "2026-10-17T00:00+02:00")),
+    ],
+)
+def test_day_month_end_follows_the_start(now, first, last, expected):
+    assert span(first, last, now) == expected
+
+
+def test_day_month_end_alone_is_still_the_nearest_occurrence():
+    assert parse_when("30/04", "to", now=NOW).date() == date(2026, 5, 1)  # 2026-04-30 included
+
+
+def test_every_short_day_month_range_lands_after_its_start():
+    """Any start over two years and any length the core accepts (62 days at most): the
+    yearless end is the first occurrence after the start, whatever the year change."""
+    for offset in range(0, 730, 3):
+        start_day = date(2026, 1, 1) + timedelta(days=offset)
+        now = paris(2026, 6, 1, 12) + timedelta(days=offset // 2)
+        start = parse_when(start_day.isoformat(), "from", now=now)
+        for length in range(0, 62):
+            last_day = start_day + timedelta(days=length)
+            end = parse_when(f"{last_day.day:02d}/{last_day.month:02d}", "to", now=now, after=start)
+            assert end == day_start(last_day + timedelta(days=1), PARIS)
+
+
+@pytest.mark.parametrize(
+    ("first", "last", "end_day"),
+    [
+        ("16/10", "14/10", date(2026, 10, 15)),  # reversed: not 14/10/2027
+        ("today", "10/10", date(2026, 10, 11)),
+        ("16/10 14h", "16/10 10h", None),
+    ],
+)
+def test_reversed_day_month_range_stays_reversed(first, last, end_day):
+    """So the core reports "end before start", not a range one year long."""
+    start = parse_when(first, "from", now=NOW)
+    end = parse_when(last, "to", now=NOW, after=start)
+    assert end.astimezone(UTC) < start.astimezone(UTC)
+    if end_day is not None:
+        assert end == day_start(end_day, PARIS)
+
+
+@pytest.mark.parametrize("text", ["+7d", "demain", "16/10/2026", "2026-10-16", "14:00", "now"])
+def test_after_only_changes_yearless_day_month(text):
+    after = paris(2027, 4, 1)
+    assert parse_when(text, "to", now=NOW, after=after) == parse_when(text, "to", now=NOW)
+
+
+def test_after_follows_the_local_day_of_the_start():
+    # 31/12 23:30 UTC is 01/01/2027 in Paris. 02/07 is then 182 days ahead (2027) against
+    # 183 back; around the UTC day (31/12/2026) the 2026 occurrence would win.
+    after = datetime(2026, 12, 31, 23, 30, tzinfo=UTC)
+    assert parse_when("02/07", "to", now=NOW, after=after) == paris(2027, 7, 3)
+    assert parse_when("02/07", "to", now=NOW, after=paris(2026, 12, 31)) == paris(2026, 7, 3)
+
+
+def test_after_is_for_aware_to_bounds_only():
+    with pytest.raises(ValueError):
+        parse_when("16/10", "from", now=NOW, after=NOW)
+    with pytest.raises(ValueError):
+        parse_when("16/10", "since", now=NOW, after=NOW)
+    with pytest.raises(ValueError):
+        parse_when("16/10", "to", now=NOW, after=datetime(2026, 10, 12))
+
+
+def test_after_keeps_invalid_dates_invalid():
+    with pytest.raises(InvalidRequest, match="^Date invalide pour --to : « 31/02 »"):
+        parse_when("31/02", "to", now=NOW, after=NOW)
+    # 29/02 exists in 2028 only: valid around a 2028 start, invalid around a 2026 one.
+    assert parse_when("29/02", "to", now=NOW, after=paris(2028, 2, 1)) == paris(2028, 3, 1)
+    with pytest.raises(InvalidRequest):
+        parse_when("29/02", "to", now=NOW, after=NOW)
+
+
 # --- invalid input -------------------------------------------------------------------------
 
 INVALID = [

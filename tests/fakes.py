@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 from outlook_bridge.errors import NewOutlookDetected
 from outlook_bridge.gateway import AcceptEvent, AcceptMail, MailQuery
+from outlook_bridge.mail import folder_not_found
 from outlook_bridge.models import Account, Event, Folder, MailDetail, MailSummary, Status
 
 PARIS = ZoneInfo("Europe/Paris")
@@ -84,7 +85,9 @@ class FakeGateway:
     """In-memory OutlookGateway with the same contract as ComGateway.
 
     `errors` maps a method name to the exception that method raises. `status` never raises:
-    like ComGateway, it reports the failure as an unreachable Status.
+    like ComGateway, it reports the failure as an unreachable Status. With `strict_folders`,
+    `search_mail` raises NotFound, as ComGateway does, for a folder that holds no mail and is
+    not in `folders` (by default an unknown folder is just empty).
     """
 
     def __init__(
@@ -93,11 +96,13 @@ class FakeGateway:
         events: list[Event] | None = None,
         folders: list[Folder] | None = None,
         errors: dict[str, BaseException] | None = None,
+        strict_folders: bool = False,
     ) -> None:
         self.mails = mails or []
         self.events = events or []
         self.folders = folders or []
         self.errors = errors or {}
+        self.strict_folders = strict_folders
         self.calls: list[tuple] = []
         self.closed = False
 
@@ -133,6 +138,11 @@ class FakeGateway:
         self._fail("search_mail")
         self.calls.append(("search_mail", query))
         folder = query.folder.casefold()
+        if self.strict_folders and folder not in {
+            *(f.path.casefold() for f in self.folders),
+            *(m.folder.casefold() for m in self.mails),
+        }:
+            raise folder_not_found(query.folder)
         found: list[MailSummary] = []
         for mail in sorted(self.mails, key=lambda m: m.received, reverse=True):
             if len(found) >= query.limit:

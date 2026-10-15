@@ -5,6 +5,8 @@ Synthetic data only (example.com, "Réunion test", the invented IBAN of test_red
 
 from __future__ import annotations
 
+import contextlib
+import itertools
 import json
 import os
 import re
@@ -15,24 +17,29 @@ from pathlib import Path
 import pytest
 
 from outlook_bridge import export, models
+from outlook_bridge.audit import Auditor
 from outlook_bridge.config import Config
 from outlook_bridge.core import Bridge
 from outlook_bridge.errors import ConfigError, ExportError, OutlookNotRunning
+from outlook_bridge.events import find_meeting_url
 from outlook_bridge.export import (
     CALENDAR_JSON,
     CALENDAR_MD,
     INBOX_FILE,
     SNAPSHOT_FILES,
+    collect_calendar,
     collect_inbox,
     export_snapshots,
     inside_git_worktree,
     last_export,
+    render_calendar_md,
     render_inbox_md,
     resolve_out_dir,
+    snapshot_event,
     write_files,
 )
 from outlook_bridge.models import CalendarSnapshot, SnapshotEvent
-from tests.fakes import NOW, PARIS, FakeGateway, make_event, make_mail
+from tests.fakes import NOW, PARIS, FakeGateway, MemorySink, StepTimer, make_event, make_mail
 
 IBAN = "FR12 3456 7890 1234 5678 9012 345"  # invented, IBAN-shaped (as in test_redact.py)
 HOSTILE = "Ligne1\n---\ngenerated_at: faux\n# Titre\x1b[2J"
@@ -40,6 +47,8 @@ HOSTILE_INLINE = r"Ligne1 --- generated\_at: faux # Titre"
 MARKDOWN_TRAP = "![x](https://example.com/p.png) [lien](https://example.com) <img src=x> | `c`"
 BODY_MARKER = "MARQUEUR-CORPS-COMPLET"
 URL_MARKER = "MARQUEUR-URL"
+# As ComGateway sees it: the join link (with its passcode) is the event's Location.
+TEAMS_LOCATION = f"https://teams.microsoft.com/l/meetup-join/{URL_MARKER}?pwd=MARQUEUR-PWD"
 RAW_IDS = ("MAIL-", "EVT-", "STORE-", "CONV-")
 
 
@@ -104,7 +113,8 @@ def events() -> list:
             30,
             busy_status="tentative",
             is_recurring=True,
-            online_meeting_url=f"https://teams.microsoft.com/l/meetup-join/{URL_MARKER}",
+            location=TEAMS_LOCATION,
+            online_meeting_url=find_meeting_url(TEAMS_LOCATION, None),
         ),
         make_event(3, at(11, 22), 180, subject="Garde test"),  # started before the range
         make_event(4, at(14), 24 * 60, all_day=True, busy_status="oof", subject="Formation test"),
@@ -170,11 +180,15 @@ def test_snapshot_event_is_an_allow_list():
         "account",
     ]
     event = events()[1]
-    snap = SnapshotEvent.from_event(event)
+    assert event.online_meeting_url and URL_MARKER in event.location  # the fixture is realistic
+    snap = snapshot_event(event)
     assert snap.untrusted_content is True
     assert snap.has_online_meeting is True
     assert snap.subject == event.subject and snap.start == event.start
-    assert URL_MARKER not in snap.model_dump_json()
+    assert snap.location == "[lien retiré]"
+    assert URL_MARKER not in snap.model_dump_json() and "MARQUEUR-PWD" not in snap.model_dump_json()
+    assert snapshot_event(events()[0]).has_online_meeting is False
+    assert snapshot_event(events()[0]).location == "Salle A"
     assert SnapshotEvent.from_event(events()[0]).has_online_meeting is False
 
 
@@ -275,16 +289,40 @@ def test_headers_and_shared_generated_at(written):
     assert stamps == {"2026-10-12T12:00:00+02:00"}
 
 
+def test_the_clock_is_read_once_for_the_three_files(gateway, config, out):
+    """A real clock advances: every file must carry the instant read once at the start."""
+    ticks = (NOW + timedelta(seconds=61 * i) for i in itertools.count())
+    auditor = Auditor(MemorySink(), source="test", clock=lambda: NOW, timer=StepTimer())
+    bridge = Bridge(gateway, config, audit=auditor, clock=lambda: next(ticks))
+    result = export_snapshots(bridge, out)
+    stamps = {
+        re.search(r"^generated_at: (.+)$", (out / name).read_text(encoding="utf-8"), re.M).group(1)
+        for name in (INBOX_FILE, CALENDAR_MD)
+    }
+    stamps.add(json.loads((out / CALENDAR_JSON).read_text(encoding="utf-8"))["generated_at"])
+    assert stamps == {"2026-10-12T12:00:00+02:00"}
+    assert result.generated_at == NOW
+    assert next(ticks) == NOW + timedelta(seconds=61)  # the bridge clock was read exactly once
+
+
+def assert_inert_markdown(text: str) -> None:
+    """No forged front matter, heading, escape sequence, link, image or code span."""
+    lines = text.split("\n")
+    closing = lines.index("---", 1)
+    assert "\x1b" not in text
+    assert [i for i, line in enumerate(lines) if line.startswith("---")] == [0, closing]
+    assert all(i < closing for i, line in enumerate(lines) if line.startswith("generated_at"))
+    assert not any(line.startswith("# Titre") for line in lines)
+    markdown_it = pytest.importorskip("markdown_it")
+    html = markdown_it.MarkdownIt("commonmark").render(text)
+    assert "<img" not in html and "<a " not in html and "<code>" not in html
+
+
 def test_hostile_text_stays_on_one_line(written):
     for name in (INBOX_FILE, CALENDAR_MD):
-        text = written[name]
-        lines = text.split("\n")
-        closing = lines.index("---", 1)
-        assert "\x1b" not in text
-        assert [i for i, line in enumerate(lines) if line.startswith("---")] == [0, closing]
-        assert all(i < closing for i, line in enumerate(lines) if line.startswith("generated_at"))
-        assert not any(line.startswith("# Titre") for line in lines)
+        lines = written[name].split("\n")
         assert sum(HOSTILE_INLINE in line for line in lines) == 1
+        assert_inert_markdown(written[name])
 
 
 def test_untrusted_markdown_cannot_build_links_or_html(written):
@@ -295,11 +333,76 @@ def test_untrusted_markdown_cannot_build_links_or_html(written):
     assert r"!\[x\](https://example.com/p.png)" in written[INBOX_FILE]
 
 
+HOSTILE_VALUES = pytest.mark.parametrize("value", [HOSTILE, MARKDOWN_TRAP], ids=["lignes", "md"])
+
+
+@HOSTILE_VALUES
+@pytest.mark.parametrize("field", ["subject", "sender_name", "sender_email", "snippet", "account"])
+def test_every_untrusted_mail_field_is_inert(field: str, value: str):
+    hostile = make_mail(1, unread=True, **{field: value})
+    other = make_mail(2, account="perso@example.org", store_id="STORE-2")  # shows the accounts
+    bridge = Bridge(FakeGateway(mails=[hostile, other]), Config(), clock=lambda: NOW)
+    text = render_inbox_md(collect_inbox(bridge, NOW), PARIS)
+    assert_inert_markdown(text)
+    if value == HOSTILE:
+        assert sum(HOSTILE_INLINE in line for line in text.split("\n")) == 1
+    else:
+        assert r"!\[x\](https://example.com/p.png)" in text
+
+
+@HOSTILE_VALUES
+@pytest.mark.parametrize("field", ["subject", "location", "organizer", "account"])
+def test_every_untrusted_event_field_is_inert(field: str, value: str):
+    hostile = make_event(1, at(13, 10), **{field: value})
+    other = make_event(2, at(13, 14), account="perso@example.org", store_id="STORE-2")
+    bridge = Bridge(FakeGateway(events=[hostile, other]), Config(), clock=lambda: NOW)
+    text = render_calendar_md(collect_calendar(bridge, NOW), PARIS)
+    assert_inert_markdown(text)
+    if value == HOSTILE:
+        assert sum(HOSTILE_INLINE in line for line in text.split("\n")) == 1
+
+
 def test_no_ids_bodies_or_meeting_urls_anywhere(written):
     for text in written.values():
         assert BODY_MARKER not in text
-        assert URL_MARKER not in text and "teams.microsoft.com" not in text
+        assert URL_MARKER not in text and "MARQUEUR-PWD" not in text
+        assert "teams.microsoft.com" not in text
         assert not [raw for raw in RAW_IDS if raw in text]
+
+
+def test_links_in_locations_never_reach_the_snapshot(out):
+    jitsi = f"Salle B ou HTTPS://meet.jit.si/{URL_MARKER}-2"  # a provider find_meeting_url ignores
+    site = f"Plan : www.example.com/{URL_MARKER}-3"
+    hostile = [
+        make_event(1, at(13, 10), location=TEAMS_LOCATION, online_meeting_url=TEAMS_LOCATION),
+        make_event(2, at(13, 14), location=jitsi),
+        make_event(3, at(13, 16), location=site),
+        make_event(4, at(13, 17), location="Salle A"),
+    ]
+    export_snapshots(Bridge(FakeGateway(events=hostile), Config(), clock=lambda: NOW), out)
+    texts = {name: (out / name).read_text(encoding="utf-8") for name in SNAPSHOT_FILES}
+    for text in texts.values():
+        assert URL_MARKER not in text and "MARQUEUR-PWD" not in text
+        assert "teams.microsoft.com" not in text and "meet.jit.si" not in text
+    locations = {e["subject"]: e["location"] for e in json.loads(texts[CALENDAR_JSON])["events"]}
+    assert locations == {
+        "Point projet 1": "[lien retiré]",
+        "Point projet 2": "Salle B ou [lien retiré]",
+        "Point projet 3": "Plan : [lien retiré]",
+        "Point projet 4": "Salle A",
+    }
+    calendar_md = texts[CALENDAR_MD]
+    assert r"- 10:00-11:00 · **Point projet 1** · \[lien retiré\] · visio" in calendar_md
+    assert r"- 14:00-15:00 · **Point projet 2** · Salle B ou \[lien retiré\]" in calendar_md
+    assert "- 17:00-18:00 · **Point projet 4** · Salle A" in calendar_md
+    # the Markdown renderer removes links too, even from a snapshot built without them removed
+    bridge = Bridge(FakeGateway(events=hostile), Config(), clock=lambda: NOW)
+    unfiltered = collect_calendar(bridge, NOW).model_copy(
+        update={"events": [SnapshotEvent.from_event(e) for e in hostile]}
+    )
+    rendered = render_calendar_md(unfiltered, PARIS)
+    assert URL_MARKER not in rendered and "MARQUEUR-PWD" not in rendered
+    assert r"Salle B ou \[lien retiré\]" in rendered
 
 
 # ---------------------------------------------------------------------------- calendar
@@ -321,17 +424,52 @@ def test_calendar_md_lists_all_fourteen_days(written):
 def test_calendar_md_event_lines(written):
     text = written[CALENDAR_MD]
     monday = section(text, "## lundi 12 octobre 2026")
-    assert monday.startswith("- dim. 11/10 22:00 au 01:00 · **Garde test**")
+    assert monday.startswith("- dim. 11/10 22:00 au 01:00 (suite) · **Garde test**")
     assert (
         "- 14:00-15:00 · **Point projet 1** · Salle A · org. Bob Exemple · 2 participants" in monday
     )
-    assert "- 16:00-16:30 · **Point projet 2** · provisoire, récurrent, visio" in monday
+    assert (
+        r"- 16:00-16:30 · **Point projet 2** · \[lien retiré\] · provisoire, récurrent, visio"
+        in monday
+    )
     assert "- journée · **Formation test** · absent" in section(text, "## mercredi 14 octobre")
-    friday = section(text, "## vendredi 16 octobre")
-    assert "- journées jusqu'au dim. 18/10 · **Séminaire** · libre" in friday
-    assert text.count("Séminaire") == 1  # a multi-day event is listed once
+    # a multi-day event is under each of its days, the following ones marked "(suite)"
+    seminar = [
+        section(text, f"## {day} octobre").strip()
+        for day in ("vendredi 16", "samedi 17", "dimanche 18")
+    ]
+    assert seminar == [
+        "- journées jusqu'au dim. 18/10 · **Séminaire** · libre",
+        "- journées jusqu'au dim. 18/10 (suite) · **Séminaire** · libre",
+        "- journée (suite) · **Séminaire** · libre",
+    ]
+    assert text.count("Séminaire") == 3
+    assert "\nevent_count: 7\n" in text  # each event is still counted once
     assert "Dernier jour test" in section(text, "## dimanche 25 octobre 2026")
     assert "Hors plage test" not in text
+
+
+def test_a_day_covered_by_an_event_is_never_empty():
+    # lun. 19/10 to ven. 23/10 all day, then mar. 20/10 18:00 to mer. 21/10 20:00
+    leave = make_event(1, at(19), 5 * 1440, all_day=True, busy_status="oof", subject="Congés test")
+    on_call = make_event(2, at(20, 18), 26 * 60, subject="Astreinte test")
+    bridge = Bridge(FakeGateway(events=[leave, on_call]), Config(), clock=lambda: NOW)
+    text = render_calendar_md(collect_calendar(bridge, NOW), PARIS)
+    days = {
+        day: section(text, f"## {day} octobre 2026").strip()
+        for day in ("lundi 19", "mardi 20", "mercredi 21", "jeudi 22", "vendredi 23", "samedi 24")
+    }
+    assert days == {
+        "lundi 19": "- journées jusqu'au ven. 23/10 · **Congés test** · absent",
+        "mardi 20": "- journées jusqu'au ven. 23/10 (suite) · **Congés test** · absent\n"
+        "- 18:00 au mer. 21/10 20:00 · **Astreinte test**",
+        "mercredi 21": "- journées jusqu'au ven. 23/10 (suite) · **Congés test** · absent\n"
+        "- mar. 20/10 18:00 au 20:00 (suite) · **Astreinte test**",
+        "jeudi 22": "- journées jusqu'au ven. 23/10 (suite) · **Congés test** · absent",
+        "vendredi 23": "- journée (suite) · **Congés test** · absent",
+        "samedi 24": "- (aucun événement)",
+    }
+    assert "\nevent_count: 2\n" in text
 
 
 def test_calendar_md_free_slots(written):
@@ -342,6 +480,33 @@ def test_calendar_md_free_slots(written):
     assert "- mer. 14/10 : aucun" in slots  # all-day out of office
     assert "- lun. 19/10 : 10:00-19:00 (9 h)" in slots
     assert "sam." not in slots and "dim." not in slots
+
+
+SLOTS_NOTE = (
+    "Les événements masqués par un mot-clé du sujet comptent comme occupés ; les comptes et "
+    "calendriers exclus par la configuration sont ignorés."
+)
+
+
+def test_free_slots_note_says_what_counts_as_busy():
+    hidden = [
+        make_event(1, at(13, 10), calendar="Calendar/Perso", subject="Perso test"),
+        make_event(2, at(13, 15), subject="Rendez-vous confidentiel test"),
+        make_event(3, at(14, 10), account="perso@example.org", subject="Autre compte test"),
+    ]
+    config = Config(
+        accounts_allowed=["alice@example.com"],
+        folders_excluded=["Perso"],
+        subject_keywords_excluded=["confidentiel"],
+    )
+    bridge = Bridge(FakeGateway(events=hidden), config, clock=lambda: NOW)
+    text = render_calendar_md(collect_calendar(bridge, NOW), PARIS)
+    slots = section(text, "## Créneaux libres")
+    assert SLOTS_NOTE in slots
+    # the sentence is true: only the keyword-hidden event blocks its hour
+    assert "- mar. 13/10 : 09:00-15:00 (6 h), 16:00-19:00 (3 h)" in slots
+    assert "- mer. 14/10 : 09:00-19:00 (10 h)" in slots
+    assert "test" not in section(text, "## mardi 13 octobre") + section(text, "## mercredi 14")
 
 
 def test_calendar_json(written):
@@ -416,6 +581,28 @@ def test_git_worktree_is_refused(tmp_path, git_is_file):
     with pytest.raises(ExportError, match="dépôt git"):
         resolve_out_dir(Config(), target)
     assert not target.exists()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="NTFS junctions are Windows-only")
+def test_git_worktree_behind_a_junction_is_refused(tmp_path):
+    """A junction needs no admin right: the target must be checked once resolved too."""
+    winapi = pytest.importorskip("_winapi")
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "sub").mkdir()
+    link = tmp_path / "lien"
+    winapi.CreateJunction(str(repo / "sub"), str(link))
+    try:
+        target = link / "snap"
+        assert inside_git_worktree(target)
+        with pytest.raises(ExportError, match="dépôt git"):
+            resolve_out_dir(Config(snapshot_dir=str(target)), None)
+        with pytest.raises(ExportError, match="dépôt git"):
+            resolve_out_dir(Config(), target)
+        assert not (repo / "sub" / "snap").exists()
+    finally:
+        with contextlib.suppress(OSError):
+            os.rmdir(link)  # removes the junction, not its target
 
 
 def test_out_overrides_the_config(tmp_path):
@@ -504,9 +691,43 @@ def test_staging_failure_changes_no_final_file(audited_bridge, out, monkeypatch)
     with pytest.raises(ExportError, match=r"Écriture impossible dans .* \(OSError\)\.") as info:
         export_snapshots(audited_bridge, out)
     assert "MARQUEUR" not in str(info.value)
-    assert staged == ["~$inbox_digest.md.tmp", "~$calendar_next14d.md.tmp"]
+    assert len(staged) == 2
+    assert re.fullmatch(r"~\$inbox_digest\.md\.\w+\.tmp", staged[0])
+    assert re.fullmatch(r"~\$calendar_next14d\.md\.\w+\.tmp", staged[1])
     assert all((out / name).read_bytes() == b"ancien\n" for name in SNAPSHOT_FILES)
     assert leftovers(out) == []
+
+
+def test_overlapping_exports_keep_their_own_temp_files(tmp_path, monkeypatch):
+    """A second export (manual run during the scheduled one) stages and commits while the
+    first one is swapping: neither takes nor deletes the other's temp files."""
+    real_replace = os.replace
+    swaps: list[str] = []
+
+    def other_export_in_between(src, dst):
+        swaps.append(Path(dst).name)
+        if len(swaps) == 1:
+            assert write_files(tmp_path, {"a.md": "B\n", "b.md": "B\n"}) == [
+                ("a.md", 2),
+                ("b.md", 2),
+            ]
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(export.os, "replace", other_export_in_between)
+    assert write_files(tmp_path, {"a.md": "A\n", "b.md": "A\n"}) == [("a.md", 2), ("b.md", 2)]
+    assert swaps == ["a.md", "a.md", "b.md", "b.md"]
+    assert (tmp_path / "a.md").read_text(encoding="utf-8") == "A\n"
+    assert (tmp_path / "b.md").read_text(encoding="utf-8") == "A\n"
+    assert leftovers(tmp_path) == []
+
+
+def test_temp_files_of_another_run_are_left_alone(tmp_path):
+    foreign = tmp_path / f"{export.TMP_PREFIX}a.md.tmp"
+    foreign.write_text("autre export en cours\n", encoding="utf-8")
+    write_files(tmp_path, {"a.md": "A\n"})
+    assert foreign.read_text(encoding="utf-8") == "autre export en cours\n"
+    assert (tmp_path / "a.md").read_text(encoding="utf-8") == "A\n"
+    assert leftovers(tmp_path) == [foreign.name]
 
 
 def test_replace_is_retried_on_permission_error(audited_bridge, out, monkeypatch):

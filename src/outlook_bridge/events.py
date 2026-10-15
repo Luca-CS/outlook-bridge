@@ -10,8 +10,8 @@ from outlook_bridge.audit import Auditor, audited
 from outlook_bridge.config import Config
 from outlook_bridge.errors import InvalidRequest, NotFound
 from outlook_bridge.gateway import OutlookGateway
-from outlook_bridge.models import Event, FreeSlot
-from outlook_bridge.redact import REDACT_MARGIN, Policy, body_limit, clip_body
+from outlook_bridge.models import REDACT_MARGIN, Event, FreeSlot
+from outlook_bridge.redact import Policy, body_limit, clip_body
 from outlook_bridge.timeutil import ensure_aware, jet_datetime, parse_working_hours
 
 MAX_RANGE_DAYS = 62
@@ -133,7 +133,9 @@ class CalendarService:
         start, end = ensure_aware(start, tz), ensure_aware(end, tz)
         _check_range(start, end)
         if calendar and self._policy.folder_excluded(calendar):
-            raise NotFound("Calendrier")
+            # Same answer as an unknown calendar (the gateway returns no event): an error
+            # here would reveal which names are in `folders_excluded`.
+            return []
         events = self._gw.list_events(start, end, calendar, self._policy.event_visible)
         return [self._policy.redact_event(e) for e in sorted(events, key=lambda e: e.start)]
 

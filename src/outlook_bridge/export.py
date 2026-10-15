@@ -6,14 +6,17 @@ audited core, so exclusions and redaction apply) before anything is written; the
 are then staged next to their target and swapped in with `os.replace`. A failed run leaves
 the previous files untouched: their old `generated_at` is the honest staleness signal.
 
-Never written: full bodies, EntryIDs, StoreIDs and meeting URLs. Untrusted inline text always
-goes through `fmt.md_inline`, never into the front matter or a heading.
+Never written: full bodies, EntryIDs, StoreIDs and meeting URLs (any link in a location
+becomes `[lien retiré]`). Untrusted inline text always goes through `fmt.md_inline`, never
+into the front matter or a heading.
 """
 
 from __future__ import annotations
 
 import contextlib
 import os
+import re
+import tempfile
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -24,6 +27,7 @@ from outlook_bridge.config import Config
 from outlook_bridge.core import Bridge
 from outlook_bridge.errors import ConfigError, ExportError
 from outlook_bridge.fmt import (
+    clean_line,
     day_label,
     display_path,
     duration,
@@ -39,6 +43,7 @@ from outlook_bridge.fmt import (
 from outlook_bridge.mail import MAX_LIMIT
 from outlook_bridge.models import (
     CalendarSnapshot,
+    Event,
     ExportedFile,
     ExportResult,
     FreeSlot,
@@ -58,6 +63,9 @@ SLOT_MIN_DURATION = 60
 SCHEMA_VERSION = 1
 TMP_PREFIX = "~$"  # Office temp-file convention, usually skipped by sync clients
 INLINE_MAX = 200  # untrusted inline fields (subject, names, location) in the Markdown files
+URL_REMOVED = "[lien retiré]"
+# Any web link in a location: a join link put there carries the meeting ID and its passcode.
+_URL = re.compile(r"https?://\S+|\bwww\.\S+", re.IGNORECASE)
 
 CALENDAR_NOTICE = (
     "Instantané figé à generated_at, peut-être périmé. "
@@ -84,9 +92,15 @@ def _expand(text: str) -> str:
 
 
 def inside_git_worktree(path: Path) -> bool:
-    """True when `path` or one of its ancestors holds a `.git` (folder or worktree file)."""
-    path = Path(os.path.abspath(path))
-    return any((folder / ".git").exists() for folder in (path, *path.parents))
+    """True when `path` or one of its ancestors holds a `.git` (folder or worktree file), as
+    written or once junctions, symlinks and SUBST drives are resolved (`realpath`, which also
+    accepts a leaf that does not exist yet)."""
+    candidates = [Path(os.path.abspath(path))]
+    with contextlib.suppress(OSError, ValueError):
+        candidates.append(Path(os.path.realpath(path)))
+    return any(
+        (folder / ".git").exists() for found in candidates for folder in (found, *found.parents)
+    )
 
 
 def resolve_out_dir(config: Config, out: Path | None) -> Path:
@@ -172,6 +186,18 @@ def collect_inbox(bridge: Bridge, now: datetime) -> InboxDigest:
     )
 
 
+def _without_urls(text: str) -> str:
+    return _URL.sub(URL_REMOVED, text)
+
+
+def snapshot_event(event: Event) -> SnapshotEvent:
+    """The allow-listed copy of `event`, without any web link in its location: ComGateway
+    finds the meeting URL there, and only `has_online_meeting` may reach the snapshot."""
+    return SnapshotEvent.from_event(event).model_copy(
+        update={"location": _without_urls(event.location)}
+    )
+
+
 def collect_calendar(bridge: Bridge, now: datetime) -> CalendarSnapshot:
     """Events of the next 14 days (today included) and the free slots left in them."""
     config = bridge.config
@@ -189,7 +215,7 @@ def collect_calendar(bridge: Bridge, now: datetime) -> CalendarSnapshot:
         range_start=start,
         range_end=end,
         notice=CALENDAR_NOTICE,
-        events=[SnapshotEvent.from_event(e) for e in events],
+        events=[snapshot_event(e) for e in events],
         free_slots=free_slots,
         free_slots_min_duration_min=SLOT_MIN_DURATION,
         working_hours=config.working_hours,
@@ -300,7 +326,7 @@ def render_inbox_md(digest: InboxDigest, tz: tzinfo) -> str:
 
 def _event_line(event: SnapshotEvent, day: date, tz: tzinfo, show_account: bool) -> str:
     parts = [time_span(event, day, tz), f"**{_inline(event.subject) or '(sans objet)'}**"]
-    if location := _inline(event.location):
+    if location := _inline(_without_urls(clean_line(event.location))):
         parts.append(location)
     if organizer := _inline(event.organizer):
         parts.append(f"org. {organizer}")
@@ -371,8 +397,9 @@ def render_calendar_md(snapshot: CalendarSnapshot, tz: tzinfo) -> str:
         "",
         "## Créneaux libres",
         f"Au moins {snapshot.free_slots_min_duration_min} min, {snapshot.working_hours}, "
-        f"jours ouvrés, à partir du {long_dt(slots_from, tz)}. Les événements masqués par la "
-        "configuration comptent comme occupés.",
+        f"jours ouvrés, à partir du {long_dt(slots_from, tz)}. Les événements masqués par un "
+        "mot-clé du sujet comptent comme occupés ; les comptes et calendriers exclus par la "
+        "configuration sont ignorés.",
         *_slot_lines(snapshot.free_slots, slots_from.astimezone(tz).date(), last, tz),
     ]
     return "\n".join(lines) + "\n"
@@ -413,19 +440,26 @@ def write_files(
     delay_s: float = 0.5,
     sleep: Callable[[float], None] = time.sleep,
 ) -> list[tuple[str, int]]:
-    """Two-phase write: stage every text as `~$<name>.tmp` in `target`, then swap them in.
+    """Two-phase write: stage every text as `~$<name>.<unique>.tmp` in `target`, then swap
+    them in.
 
     A staging failure changes no final file. The swap (`os.replace`, atomic on NTFS within a
-    folder) is retried on PermissionError, which a sync client or a reader may cause. Temp
-    files of this run are always removed. Returns (name, size in bytes) in commit order.
+    folder) is retried on PermissionError, which a sync client or a reader may cause. Staging
+    names are unique to this run (`mkstemp`), so an overlapping export never takes or deletes
+    them; only this run's temp files are removed. Returns (name, size in bytes) in commit
+    order.
     """
     staged: list[tuple[str, Path, int]] = []
     committed: list[str] = []
     try:
         for name, text in files.items():
-            tmp = target / f"{TMP_PREFIX}{name}.tmp"
-            staged.append((name, tmp, len(text.encode("utf-8"))))
             try:
+                handle, raw = tempfile.mkstemp(
+                    prefix=f"{TMP_PREFIX}{name}.", suffix=".tmp", dir=target
+                )
+                tmp = Path(raw)
+                staged.append((name, tmp, len(text.encode("utf-8"))))
+                os.close(handle)
                 tmp.write_text(text, encoding="utf-8", newline="\n")
             except OSError as exc:
                 raise ExportError(

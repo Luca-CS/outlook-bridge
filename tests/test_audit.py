@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import inspect
 import json
+import os
 import re
+import subprocess
 import sys
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from outlook_bridge import audit as audit_module
+from outlook_bridge import core
 from outlook_bridge.audit import (
     TOOL_NAMES,
     Auditor,
@@ -21,7 +27,7 @@ from outlook_bridge.audit import (
     result_count,
     scrub_params,
 )
-from outlook_bridge.config import Config, data_dir
+from outlook_bridge.config import Config, data_dir, log_dir
 from outlook_bridge.core import Bridge
 from outlook_bridge.errors import (
     InvalidRequest,
@@ -177,6 +183,16 @@ def test_ids_and_accounts_are_hashed(audited_bridge, sink):
 def test_fingerprint_is_short_and_stable():
     assert re.fullmatch(r"#[0-9a-f]{10}", fingerprint("MAIL-1"))
     assert fingerprint("MAIL-1") == fingerprint("MAIL-1") != fingerprint("MAIL-2")
+
+
+def test_fingerprint_is_documented_as_a_guessable_pseudonym():
+    """Unsalted on purpose (the log stays local): a guessed short name can be confirmed,
+    so the docstring must not promise more than a pseudonym."""
+    guess = "Inbox/Dossier test"
+    assert fingerprint(guess) == "#" + hashlib.sha256(guess.encode("utf-8")).hexdigest()[:10]
+    doc = " ".join((fingerprint.__doc__ or "").split()).casefold()
+    assert "non-reversible" not in doc
+    assert "pseudonym" in doc and "guess" in doc
 
 
 @pytest.mark.parametrize(
@@ -500,11 +516,97 @@ def test_concurrent_writes_stay_whole_lines(tmp_path):
     assert all(json.loads(line)["tool"] == "search_mail" for line in lines)
 
 
+# One writer process: signals it is ready, waits for the start file, then appends.
+_WRITER = """
+import sys, time
+from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+from outlook_bridge.audit import JsonlSink
+
+directory, signals = Path(sys.argv[1]), Path(sys.argv[4])
+worker, count = int(sys.argv[2]), int(sys.argv[3])
+sink = JsonlSink(directory)
+when = datetime(2026, 10, 12, 12, 0, tzinfo=ZoneInfo("Europe/Paris"))
+(signals / f"ready-{worker}").touch()
+deadline = time.monotonic() + 60
+while not (signals / "go").exists() and time.monotonic() < deadline:
+    time.sleep(0.001)
+for n in range(count):
+    sink.write({"worker": worker, "n": n, "pad": "x" * 300}, when)
+"""
+
+
+def test_concurrent_processes_never_lose_a_record(tmp_path):
+    """MCP server, scheduled export and manual CLI may append to the same file at once.
+
+    On Windows a CRT append is seek-to-end then write: without a cross-process lock, two
+    writers land on the same offset and one record silently replaces the other.
+    """
+    workers, count = 6, 300
+    signals = tmp_path / "signals"
+    signals.mkdir()
+    logs = tmp_path / "logs"
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", _WRITER, str(logs), str(w), str(count), str(signals)]
+        )
+        for w in range(workers)
+    ]
+    try:
+        deadline = time.monotonic() + 60
+        while len(list(signals.glob("ready-*"))) < workers and time.monotonic() < deadline:
+            time.sleep(0.01)
+        (signals / "go").touch()
+        assert [proc.wait(timeout=120) for proc in procs] == [0] * workers
+    finally:
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+    lines = (logs / "audit-2026-10.jsonl").read_text(encoding="utf-8").splitlines()
+    records = [json.loads(line) for line in lines]  # every line whole
+    assert len(records) == workers * count
+    assert {(r["worker"], r["n"]) for r in records} == {
+        (w, n) for w in range(workers) for n in range(count)
+    }
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="msvcrt byte-range locks are Windows-only")
+def test_lock_held_elsewhere_fails_open(tmp_path, monkeypatch, capsys):
+    """A writer stuck holding the lock delays a record a little, never drops it."""
+    import msvcrt
+
+    monkeypatch.setattr(audit_module, "_LOCK_WAIT_S", 0.05)
+    sink = JsonlSink(tmp_path)
+    path = sink.path_for(NOW)
+    with path.open("ab", buffering=0) as other:
+        os.lseek(other.fileno(), audit_module._LOCK_OFFSET, os.SEEK_SET)
+        msvcrt.locking(other.fileno(), msvcrt.LK_NBLCK, 1)
+        sink.write({"n": 1}, NOW)  # waits, then writes unlocked
+        sink.write({"n": 2}, NOW)  # locking now off: no further wait
+        os.lseek(other.fileno(), audit_module._LOCK_OFFSET, os.SEEK_SET)
+        msvcrt.locking(other.fileno(), msvcrt.LK_UNLCK, 1)
+    assert path.read_bytes() == b'{"n":1}\n{"n":2}\n'
+    assert sink._locking is False
+    assert capsys.readouterr().err == ""
+
+
 # ---------------------------------------------------------------- wiring and lifecycle
 
 
+class _RolloverDatetime(datetime):
+    """`datetime.now` frozen at 01/11/2026 00:30 Paris, which is still 31/10 in UTC."""
+
+    INSTANT = datetime(2026, 10, 31, 23, 30, tzinfo=UTC)
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls.INSTANT.astimezone(tz) if tz is not None else cls.INSTANT.replace(tzinfo=None)
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="pywin32 is Windows-only")
-def test_from_environment_wires_the_audit_log(tmp_path):
+def test_from_environment_wires_the_audit_log(tmp_path, monkeypatch):
+    monkeypatch.setattr(core, "datetime", _RolloverDatetime)
     bridge = Bridge.from_environment(source="cli")
     try:
         assert bridge.audit.source == "cli"
@@ -515,6 +617,16 @@ def test_from_environment_wires_the_audit_log(tmp_path):
         assert bridge.now().tzinfo == PARIS
         assert bridge.gateway._worker._thread is None  # lazy: no STA thread, no COM yet
         assert not (tmp_path / "data").exists()  # log directory created lazily
+
+        # The audit reads the bridge's own config.tz clock: `ts` and the monthly file are
+        # local, so 00:30 on 1 November goes to November, not to UTC's October.
+        assert bridge.audit._clock is bridge.clock
+        bridge.audit.call("status", {}, lambda: None)  # a dummy call: no COM involved
+        assert [p.name for p in log_dir().iterdir()] == ["audit-2026-11.jsonl"]
+        record = json.loads((log_dir() / "audit-2026-11.jsonl").read_text(encoding="utf-8"))
+        assert record["ts"] == "2026-11-01T00:30:00.000+01:00"
+        assert (record["source"], record["tool"], record["outcome"]) == ("cli", "status", "ok")
+        assert bridge.gateway._worker._thread is None  # still no COM
     finally:
         bridge.close()
     bridge.close()  # idempotent
@@ -568,8 +680,15 @@ def test_every_tool_method_is_audited():
     )
     assert all(hasattr(m, "__wrapped__") for m in methods)
     assert tuple(m.__name__ for m in methods) == TOOL_NAMES == SPEC_TOOLS
-    for method in methods:  # signature preserved for front ends (FastMCP introspection)
-        assert inspect.signature(method) == inspect.signature(method.__wrapped__)
+    for method in methods:
+        # `__wrapped__` points at the decorated method itself, not at some other function.
+        assert method.__wrapped__.__qualname__ == method.__qualname__
+        # The wrapper carries the real signature itself (front ends such as FastMCP or typer
+        # introspect it). follow_wrapped=False: otherwise both sides follow `__wrapped__`
+        # and the check could never fail.
+        own = inspect.signature(method, follow_wrapped=False)
+        assert own == inspect.signature(method.__wrapped__)
+        assert next(iter(own.parameters)) == "self"
 
 
 def test_no_tool_calls_another_audited_tool(audited_bridge, sink):

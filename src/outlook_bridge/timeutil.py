@@ -132,22 +132,39 @@ def ceil_to(value: datetime, minutes: int = 15) -> datetime:
     return (value.astimezone(UTC) + (step - remainder) * _ONE_US).astimezone(value.tzinfo)
 
 
-def parse_when(text: str, role: Role, *, now: datetime, label: str | None = None) -> datetime:
+def parse_when(
+    text: str,
+    role: Role,
+    *,
+    now: datetime,
+    label: str | None = None,
+    after: datetime | None = None,
+) -> datetime:
     """Parse a CLI date expression (design section 5) into an aware datetime in `now.tzinfo`.
 
     `role` sets the meaning of unsigned offsets (past for "since", future for "from"/"to")
     and of day values: a day gives its midnight for "since"/"from" and the next midnight for
     "to" (exclusive bound, so the day itself is included). An instant is the same for every
     role. Raises InvalidRequest (French message naming `label`, default `--<role>`).
+
+    `after` ("to" only) is the resolved start of the range. A yearless `DD/MM` (with or
+    without a time) then takes the occurrence nearest to that start instead of today, so
+    both bounds land in the same year (`--from 01/04 --to 30/04` six months ahead) and
+    `--from 20/12 --to 05/01` crosses New Year. For any range the core accepts (62 days at
+    most) this is the first occurrence whose bound is after `after`; a reversed input stays
+    reversed and gets the core's "end before start" error, not a range one year long.
     """
     if role not in ROLES:
         raise ValueError(f"unknown role: {role!r}")
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("parse_when needs an aware `now`")
+    if after is not None and (role != "to" or after.tzinfo is None or after.utcoffset() is None):
+        raise ValueError("`after` must be aware and only applies to role 'to'")
     tz = now.tzinfo
     label = label or f"--{role}"
     shown = _shown(text)
-    value = _parse_value(_normalize_text(text), role, now)
+    anchor = after.astimezone(tz).date() if after is not None else None
+    value = _parse_value(_normalize_text(text), role, now, anchor)
     if value is None:
         raise InvalidRequest(f"Date invalide pour {label} : « {shown} ». Formats : {WHEN_FORMATS}.")
     if isinstance(value, datetime):
@@ -174,8 +191,12 @@ def _shown(text: str) -> str:
     return shown if len(shown) <= MAX_WHEN_CHARS else shown[:MAX_WHEN_CHARS] + "..."
 
 
-def _parse_value(text: str, role: Role, now: datetime) -> date | datetime | None:
-    """A `date` (day value, resolved by role), an aware or local `datetime` (instant) or None."""
+def _parse_value(
+    text: str, role: Role, now: datetime, anchor: date | None = None
+) -> date | datetime | None:
+    """A `date` (day value, resolved by role), an aware or local `datetime` (instant) or None.
+
+    `anchor` is the day a yearless `DD/MM` is resolved around (default: today)."""
     if not text or len(text) > MAX_WHEN_CHARS:
         return None
     today = now.date()
@@ -195,7 +216,7 @@ def _parse_value(text: str, role: Role, now: datetime) -> date | datetime | None
         return today + timedelta(days=amount)
 
     if match := _DATE_TIME.fullmatch(text):
-        day = _parse_date(match[1], today)
+        day = _parse_date(match[1], anchor or today)
         if day is not None:
             if match[2] is None:
                 return day
@@ -215,15 +236,16 @@ def _parse_value(text: str, role: Role, now: datetime) -> date | datetime | None
     return parsed
 
 
-def _parse_date(token: str, today: date) -> date | None:
-    """`YYYY-MM-DD`, `DD/MM/YYYY`, or `DD/MM` (nearest occurrence, ties go to the future)."""
+def _parse_date(token: str, anchor: date) -> date | None:
+    """`YYYY-MM-DD`, `DD/MM/YYYY`, or `DD/MM` (occurrence nearest to `anchor`, ties go to the
+    future)."""
     try:
         if match := _ISO_DATE.fullmatch(token):
             year, month, day = (int(g) for g in match.groups())
         elif match := _FR_DATE.fullmatch(token):
             day, month = int(match[1]), int(match[2])
             if match[3] is None:
-                return _nearest(day, month, today)
+                return _nearest(day, month, anchor)
             year = int(match[3])
         else:
             return None
@@ -234,16 +256,17 @@ def _parse_date(token: str, today: date) -> date | None:
         return None
 
 
-def _nearest(day: int, month: int, today: date) -> date | None:
+def _nearest(day: int, month: int, anchor: date) -> date | None:
     candidates = []
-    for year in (today.year - 1, today.year, today.year + 1):
+    for year in (anchor.year - 1, anchor.year, anchor.year + 1):
         try:
-            candidates.append(date(year, month, day))
+            if MIN_YEAR <= year <= MAX_YEAR:
+                candidates.append(date(year, month, day))
         except ValueError:
             continue
     if not candidates:
         return None
-    return min(candidates, key=lambda c: (abs((c - today).days), c < today))
+    return min(candidates, key=lambda c: (abs((c - anchor).days), c < anchor))
 
 
 def _parse_time(token: str) -> time | None:

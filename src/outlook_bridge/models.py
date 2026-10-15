@@ -14,6 +14,12 @@ BusyStatus = Literal["free", "tentative", "busy", "oof", "working_elsewhere"]
 ResponseStatus = Literal["none", "organizer", "tentative", "accepted", "declined", "not_responded"]
 Importance = Literal["low", "normal", "high"]
 
+# Every public output carries a snippet of at most SNIPPET_MAX characters. The gateway hands
+# the core REDACT_MARGIN characters more (and fetches as many extra body characters), so that
+# a pattern straddling the cut is still redacted: the core redacts first, then clips.
+SNIPPET_MAX = 200
+REDACT_MARGIN = 200
+
 
 class _Model(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -54,7 +60,9 @@ class MailSummary(_Model):
     has_attachments: bool = False
     folder: str
     account: str
-    snippet: str = Field(default="", max_length=200)
+    # Gateway-boundary bound: the raw snippet keeps a redaction margin. The core always clips
+    # it to SNIPPET_MAX after redaction (redact.Policy.redact_mail), for every output.
+    snippet: str = Field(default="", max_length=SNIPPET_MAX + REDACT_MARGIN)
 
 
 class MailDetail(MailSummary):
