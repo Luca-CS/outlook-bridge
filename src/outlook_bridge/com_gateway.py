@@ -23,15 +23,16 @@ import win32com.client
 
 from outlook_bridge.errors import (
     NewOutlookDetected,
-    NotFound,
     OutlookBridgeError,
     OutlookNotRunning,
     OutlookUnavailable,
 )
 from outlook_bridge.events import build_jet_range, find_meeting_url
 from outlook_bridge.gateway import AcceptEvent, AcceptMail, MailQuery
-from outlook_bridge.mail import build_dasl_filter
+from outlook_bridge.mail import build_dasl_filter, folder_not_found
 from outlook_bridge.models import (
+    REDACT_MARGIN,
+    SNIPPET_MAX,
     Account,
     Attachment,
     BusyStatus,
@@ -43,7 +44,6 @@ from outlook_bridge.models import (
     ResponseStatus,
     Status,
 )
-from outlook_bridge.redact import SNIPPET_MAX
 from outlook_bridge.timeutil import DEFAULT_TZ, to_aware, to_com
 
 T = TypeVar("T")
@@ -124,6 +124,10 @@ SCAN_LIMIT = 20000  # rows scanned per folder table
 EVENTS_LIMIT = 2000  # occurrences read per calendar folder
 FOLDER_DEPTH = 5
 SHORT_LIST = 10
+# Outlook truncates PR_PREVIEW itself (about 255 characters): a preview this long was cut, and
+# its last PREVIEW_TAIL characters may hold a pattern fragment that redaction cannot match.
+PREVIEW_CAP = 250
+PREVIEW_TAIL = 40
 DEFAULT_TIMEOUT_S = 120.0
 
 
@@ -248,8 +252,18 @@ def _split_names(value: str | None, limit: int | None = None) -> list[str]:
     return names[:limit] if limit else names
 
 
-def _snippet(text: str | None) -> str:
-    return " ".join((text or "").split())[:SNIPPET_MAX]
+def _snippet(text: str | None, *, outlook_preview: bool = False) -> str:
+    """Whitespace-normalised preview, REDACT_MARGIN characters longer than what is shown: the
+    core redacts it before clipping it to SNIPPET_MAX, so a pattern straddling the cut (an
+    IBAN starting near character 200) is masked whole instead of leaking a fragment.
+
+    Outlook already cuts PR_PREVIEW at about 255 characters. A pattern cut there leaves a
+    fragment that whitespace collapsing can pull below SNIPPET_MAX, so the tail of a preview
+    that reached Outlook's cap is dropped before collapsing."""
+    text = text or ""
+    if outlook_preview and len(text) >= PREVIEW_CAP:
+        text = text[: len(text) - PREVIEW_TAIL]
+    return " ".join(text.split())[: SNIPPET_MAX + REDACT_MARGIN]
 
 
 def _clean_body(text: str | None) -> str:
@@ -473,7 +487,7 @@ class ComGateway:
                         found.append(mail)
                         taken += 1
             if resolved == 0:
-                raise NotFound(f"Dossier « {query.folder} »")
+                raise folder_not_found(query.folder)
             found.sort(key=lambda m: m.received, reverse=True)
             return found[: query.limit]
 
@@ -505,7 +519,7 @@ class ComGateway:
             has_attachments=bool(v(COL_HAS_ATTACH)),
             folder=location.path,
             account=location.account,
-            snippet=_snippet(v(COL_PREVIEW)),
+            snippet=_snippet(v(COL_PREVIEW), outlook_preview=True),
         )
 
     def get_mail(self, entry_id: str, store_id: str, max_chars: int) -> MailDetail | None:

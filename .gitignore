@@ -52,3 +52,11 @@ desktop.ini
 .DS_Store
 .vscode/
 .idea/
+
+# Phase 2 local outputs (snapshots, audit log, CLI state) — never commit
+inbox_digest.md
+calendar_next14d.md
+calendar_next14d.json
+audit-*.jsonl
+last_mails.json
+*.tmp

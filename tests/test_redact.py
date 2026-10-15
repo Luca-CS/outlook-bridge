@@ -1,4 +1,11 @@
+import ast
+import sys
+from pathlib import Path
+
+import pytest
+
 from outlook_bridge.config import Config
+from outlook_bridge.models import REDACT_MARGIN, SNIPPET_MAX
 from outlook_bridge.redact import REDACTED, Policy
 from tests.fakes import NOW, make_event, make_mail
 
@@ -33,8 +40,40 @@ def test_redact_event_covers_location_and_body():
 
 def test_redacted_snippet_stays_bounded():
     p = policy(redact_patterns=["a"])
-    mail = make_mail(1, snippet="a" * 200)
-    assert len(p.redact_mail(mail).snippet) == 200
+    mail = make_mail(1, snippet="a" * (SNIPPET_MAX + REDACT_MARGIN))
+    assert len(p.redact_mail(mail).snippet) == SNIPPET_MAX
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="pywin32 is Windows-only")
+def test_gateway_snippet_keeps_the_redaction_margin():
+    """The COM gateway must not cut the preview to SNIPPET_MAX before redaction: an IBAN
+    straddling character 200 would lose its tail and escape the pattern."""
+    from outlook_bridge.com_gateway import _snippet  # pure helper, no Outlook involved
+
+    raw = "y" * 189 + " \r\n  " + IBAN + " fin " + "z" * 500
+    snippet = _snippet(raw)
+    assert len(snippet) == SNIPPET_MAX + REDACT_MARGIN
+    assert IBAN in snippet
+    shown = policy().redact_mail(make_mail(1, snippet=snippet)).snippet
+    assert len(shown) == SNIPPET_MAX
+    assert shown.startswith("y" * 189 + " " + REDACTED)
+    assert not any(char.isdigit() for char in shown)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="pywin32 is Windows-only")
+def test_outlook_capped_preview_drops_its_cut_tail():
+    """Outlook cuts PR_PREVIEW at ~255 characters itself. Whitespace collapsing can pull an
+    IBAN fragment cut there below SNIPPET_MAX, where redaction cannot recognise it."""
+    from outlook_bridge.com_gateway import PREVIEW_CAP, _snippet
+
+    head = "mot " + " \r\n " * 40  # collapses to a few characters
+    fragment = IBAN[:14]  # "FR12 3456 7890": what Outlook's own cut leaves
+    raw = (head + "x" * 255)[: 255 - len(fragment)] + fragment
+    assert len(raw) >= PREVIEW_CAP
+    shown = policy().redact_mail(make_mail(1, snippet=_snippet(raw, outlook_preview=True)))
+    assert not any(char.isdigit() for char in shown.snippet)
+    # A body-derived snippet is not capped by Outlook: nothing is dropped.
+    assert _snippet("a b", outlook_preview=True) == "a b"
 
 
 def test_sender_rules_address_and_domain():
@@ -78,3 +117,74 @@ def test_mail_and_event_visibility():
     assert p.event_visible(make_event(1, NOW))
     assert not p.event_visible(make_event(1, NOW, subject="Entretien paie"))
     assert not p.event_visible(make_event(1, NOW, calendar="Éléments supprimés"))
+
+
+# ------------------------------------------------------------------ rule 5 in -m outlook tests
+# The integration tests read the real mailbox and cannot run here: these static checks keep a
+# failing `-m outlook` run from printing real content, and its output from staying on disk.
+
+INTEGRATION = Path(__file__).resolve().parent / "integration"
+
+
+def _bare(node: ast.expr) -> bool:
+    """A local name, a literal, or a comparison or `and`/`or`/`not` of those: pytest has no
+    sub-expression to introspect, so nothing read from Outlook can be printed."""
+    if isinstance(node, ast.Name | ast.Constant):
+        return True
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return _bare(node.operand)
+    if isinstance(node, ast.BoolOp):
+        return all(_bare(value) for value in node.values)
+    if isinstance(node, ast.Compare):
+        return all(_bare(side) for side in (node.left, *node.comparators))
+    return False
+
+
+def _unsafe_asserts(tree: ast.AST) -> list[int]:
+    return [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assert)
+        and not (_bare(node.test) and (node.msg is None or isinstance(node.msg, ast.Constant)))
+    ]
+
+
+@pytest.mark.parametrize("path", sorted(INTEGRATION.glob("test_*.py")), ids=lambda path: path.name)
+def test_real_outlook_failures_print_no_content(path: Path):
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    assert "PYTEST_DONT_REWRITE" in (ast.get_docstring(tree) or "")
+    assert _unsafe_asserts(tree) == []
+
+
+@pytest.mark.parametrize(
+    ("source", "safe"),
+    [
+        ("assert ok", True),
+        ("assert count <= 3, 'trop'", True),
+        ("assert not (a and b)", True),
+        ("assert len(items) <= 3", False),
+        ("assert result.stdout.isascii()", False),
+        ("assert mail.received == wall_clock", False),
+        ("assert ok, mail.subject", False),
+    ],
+)
+def test_assert_checker(source: str, safe: bool):
+    assert (_unsafe_asserts(ast.parse(source)) == []) is safe
+
+
+def test_real_snapshots_are_deleted_even_on_failure():
+    """The export test writes real, unexcluded snapshots: a `finally` removes them."""
+    tree = ast.parse((INTEGRATION / "test_cli_outlook.py").read_text(encoding="utf-8"))
+    exporting = [
+        func
+        for func in ast.walk(tree)
+        if isinstance(func, ast.FunctionDef)
+        and any(isinstance(n, ast.Constant) and n.value == "export" for n in ast.walk(func))
+    ]
+    assert exporting
+    for func in exporting:
+        cleaned = any(
+            isinstance(node, ast.Try) and "rmtree(" in ast.unparse(node.finalbody)
+            for node in ast.walk(func)
+        )
+        assert cleaned, func.name

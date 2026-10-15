@@ -50,10 +50,23 @@ def test_list_events_exclusions_and_redaction():
     assert "FR12" not in result[0].location
 
 
-def test_excluded_calendar_is_refused():
-    bridge, _ = bridge_with([])
-    with pytest.raises(NotFound):
-        bridge.calendar.list_events(DAY, DAY + timedelta(days=1), calendar="Éléments supprimés")
+def test_excluded_calendar_reads_like_an_unknown_one():
+    """An excluded calendar answers what an unknown one answers (no event, no error), so
+    `calendar` cannot be used to probe `folders_excluded`."""
+    end = DAY + timedelta(days=1)
+    events = [make_event(1, DAY.replace(hour=9), calendar="Agenda test")]
+    excluded, gw = bridge_with(events, folders_excluded=["Agenda test"])
+    assert excluded.calendar.list_events(DAY, end, calendar="Agenda test") == []
+    assert excluded.calendar.list_events(DAY, end, calendar="agenda TEST") == []
+    assert gw.calls == []  # never asked for: not even the time slots leave the gateway
+    unknown, _ = bridge_with(events)
+    assert unknown.calendar.list_events(DAY, end, calendar="Agenda inconnu") == []
+    default, _ = bridge_with([])
+    assert default.calendar.list_events(DAY, end, calendar="Éléments supprimés") == []
+    # Bad parameters are still refused first, whatever the calendar.
+    for bridge in (excluded, unknown):
+        with pytest.raises(InvalidRequest):
+            bridge.calendar.list_events(DAY, DAY, calendar="Agenda test")
 
 
 def test_get_event_body_and_exclusion():

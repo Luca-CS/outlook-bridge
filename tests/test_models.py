@@ -4,7 +4,7 @@ from datetime import datetime
 import pytest
 from pydantic import ValidationError
 
-from outlook_bridge.models import Event, MailDetail, MailSummary
+from outlook_bridge.models import REDACT_MARGIN, SNIPPET_MAX, Event, MailDetail, MailSummary
 from tests.fakes import NOW, make_event, make_mail
 
 
@@ -35,8 +35,11 @@ def test_unknown_fields_are_rejected():
 
 
 def test_snippet_length_is_bounded():
+    # The gateway boundary keeps a redaction margin; the core clips outputs to SNIPPET_MAX.
+    raw_max = SNIPPET_MAX + REDACT_MARGIN
+    assert len(make_mail(1, snippet="x" * raw_max).snippet) == raw_max
     with pytest.raises(ValidationError):
-        make_mail(1, snippet="x" * 201)
+        make_mail(1, snippet="x" * (raw_max + 1))
 
 
 def test_dates_serialise_with_offset():

@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from outlook_bridge.errors import NewOutlookDetected
 from outlook_bridge.gateway import AcceptEvent, AcceptMail, MailQuery
+from outlook_bridge.mail import folder_not_found
 from outlook_bridge.models import Account, Event, Folder, MailDetail, MailSummary, Status
 
 PARIS = ZoneInfo("Europe/Paris")
@@ -53,35 +56,93 @@ def _summary(mail: MailDetail) -> MailSummary:
     return MailSummary(**mail.model_dump(include=set(MailSummary.model_fields)))
 
 
+class MemorySink:
+    """AuditSink keeping the records in memory, JSON round-tripped as JsonlSink writes them."""
+
+    def __init__(self) -> None:
+        self.records: list[dict] = []
+        self.whens: list[datetime] = []
+
+    def write(self, record: dict[str, object], when: datetime) -> None:
+        self.records.append(json.loads(json.dumps(record, ensure_ascii=False)))
+        self.whens.append(when)
+
+
+class StepTimer:
+    """Deterministic perf_counter: every call advances by `step_s` seconds."""
+
+    def __init__(self, step_s: float = 0.25) -> None:
+        self.step_s = step_s
+        self.value = 0.0
+
+    def __call__(self) -> float:
+        current = self.value
+        self.value += self.step_s
+        return current
+
+
 class FakeGateway:
-    """In-memory OutlookGateway with the same contract as ComGateway."""
+    """In-memory OutlookGateway with the same contract as ComGateway.
+
+    `errors` maps a method name to the exception that method raises. `status` never raises:
+    like ComGateway, it reports the failure as an unreachable Status. With `strict_folders`,
+    `search_mail` raises NotFound, as ComGateway does, for a folder that holds no mail and is
+    not in `folders` (by default an unknown folder is just empty).
+    """
 
     def __init__(
         self,
         mails: list[MailDetail] | None = None,
         events: list[Event] | None = None,
         folders: list[Folder] | None = None,
+        errors: dict[str, BaseException] | None = None,
+        strict_folders: bool = False,
     ) -> None:
         self.mails = mails or []
         self.events = events or []
         self.folders = folders or []
+        self.errors = errors or {}
+        self.strict_folders = strict_folders
         self.calls: list[tuple] = []
+        self.closed = False
+
+    def _fail(self, method: str) -> None:
+        if (exc := self.errors.get(method)) is not None:
+            raise exc
+
+    def close(self) -> None:
+        self.closed = True
 
     def status(self) -> Status:
-        return Status(reachable=True, outlook_version="16.0", accounts=self.list_accounts())
+        if (exc := self.errors.get("status")) is not None:
+            return Status(
+                reachable=False, classic=not isinstance(exc, NewOutlookDetected), message=str(exc)
+            )
+        return Status(reachable=True, outlook_version="16.0", accounts=self._accounts())
 
     def list_accounts(self) -> list[Account]:
+        self._fail("list_accounts")
+        return self._accounts()
+
+    def _accounts(self) -> list[Account]:
         return [
             Account(display_name=ACCOUNT, smtp_address=ACCOUNT, store_id=STORE),
             Account(display_name="perso@example.org", smtp_address="", store_id="STORE-2"),
         ]
 
     def list_folders(self, account: str | None = None) -> list[Folder]:
+        self._fail("list_folders")
         return [f for f in self.folders if account is None or f.account == account]
 
     def search_mail(self, query: MailQuery, accept: AcceptMail) -> list[MailSummary]:
+        self._fail("search_mail")
         self.calls.append(("search_mail", query))
         folder = query.folder.casefold()
+        if self.strict_folders and folder not in {
+            *(f.path.casefold() for f in self.folders),
+            *(m.folder.casefold() for m in self.mails),
+        }:
+            raise folder_not_found(query.folder)
         found: list[MailSummary] = []
         for mail in sorted(self.mails, key=lambda m: m.received, reverse=True):
             if len(found) >= query.limit:
@@ -111,6 +172,7 @@ class FakeGateway:
         return found
 
     def get_mail(self, entry_id: str, store_id: str, max_chars: int) -> MailDetail | None:
+        self._fail("get_mail")
         self.calls.append(("get_mail", entry_id, store_id, max_chars))
         for mail in self.mails:
             if mail.id == entry_id and mail.store_id == store_id:
@@ -121,6 +183,7 @@ class FakeGateway:
         return None
 
     def get_thread(self, conversation_id: str, limit: int, accept: AcceptMail) -> list[MailSummary]:
+        self._fail("get_thread")
         found = [
             _summary(m)
             for m in sorted(self.mails, key=lambda m: m.received)
@@ -131,6 +194,7 @@ class FakeGateway:
     def list_events(
         self, start: datetime, end: datetime, calendar: str | None, accept: AcceptEvent
     ) -> list[Event]:
+        self._fail("list_events")
         self.calls.append(("list_events", start, end, calendar))
         return sorted(
             (
@@ -151,6 +215,7 @@ class FakeGateway:
         max_chars: int,
         occurrence_start: datetime | None = None,
     ) -> Event | None:
+        self._fail("get_event")
         for event in self.events:
             if event.id != entry_id or event.store_id != store_id:
                 continue

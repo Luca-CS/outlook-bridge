@@ -67,3 +67,7 @@ class OutlookGateway(Protocol):
     ) -> Event | None:
         """`occurrence_start` selects one occurrence of a recurring series (same EntryID)."""
         ...
+
+    def close(self) -> None:
+        """Releases the connection (COM worker thread). Idempotent; safe if never used."""
+        ...

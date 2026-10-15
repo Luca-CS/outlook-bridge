@@ -9,8 +9,12 @@ requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2.14.1",
     "pywin32>=312",
+    "typer>=0.27.3",
     "tzdata>=2026.5",
 ]
+
+[project.scripts]
+outlook-bridge = "outlook_bridge.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.13.0,<0.14.0"]

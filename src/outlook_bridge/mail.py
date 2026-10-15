@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from datetime import datetime, tzinfo
 
+from outlook_bridge.audit import Auditor, audited
 from outlook_bridge.config import Config
 from outlook_bridge.errors import InvalidRequest, NotFound
 from outlook_bridge.gateway import MailQuery, OutlookGateway
-from outlook_bridge.models import MailDetail, MailSummary
-from outlook_bridge.redact import REDACT_MARGIN, Policy, body_limit, clip_body
+from outlook_bridge.models import REDACT_MARGIN, MailDetail, MailSummary
+from outlook_bridge.redact import Policy, body_limit, clip_body
 from outlook_bridge.timeutil import dasl_datetime, ensure_aware
 
 MAX_LIMIT = 100
@@ -46,18 +47,32 @@ def build_dasl_filter(query: MailQuery, tz: tzinfo) -> str:
     return "@SQL=" + " AND ".join(parts) if parts else ""
 
 
+def folder_not_found(folder: str) -> NotFound:
+    """The one error for a folder that is missing (gateway) or excluded (core): both read the
+    same, so `--folder` cannot be used to probe `folders_excluded`."""
+    return NotFound(f"Dossier « {folder} »")
+
+
 def _check_limit(limit: int) -> int:
     if limit < 1:
-        raise InvalidRequest("limit doit être ≥ 1.")
+        raise InvalidRequest("limit doit valoir au moins 1.")
     return min(limit, MAX_LIMIT)
 
 
 class MailService:
-    def __init__(self, gateway: OutlookGateway, config: Config, policy: Policy) -> None:
+    def __init__(
+        self,
+        gateway: OutlookGateway,
+        config: Config,
+        policy: Policy,
+        audit: Auditor | None = None,
+    ) -> None:
+        self._audit = audit if audit is not None else Auditor.disabled()
         self._gw = gateway
         self._config = config
         self._policy = policy
 
+    @audited
     def search_mail(
         self,
         query: str | None = None,
@@ -76,7 +91,7 @@ class MailService:
         if since and until and since >= until:
             raise InvalidRequest("since doit précéder until.")
         if self._policy.folder_excluded(folder):
-            raise NotFound("Dossier")
+            raise folder_not_found(folder)  # word for word what the gateway says if missing
         mail_query = MailQuery(
             folder=folder,
             account=account,
@@ -90,6 +105,7 @@ class MailService:
         found = self._gw.search_mail(mail_query, self._policy.mail_visible)
         return [self._policy.redact_mail(m) for m in found[:limit]]
 
+    @audited
     def get_mail(self, id: str, store_id: str, max_chars: int | None = None) -> MailDetail:
         max_chars = body_limit(max_chars, self._config.max_body_chars)
         mail = self._gw.get_mail(id, store_id, max_chars + REDACT_MARGIN)
@@ -98,6 +114,7 @@ class MailService:
         mail = self._policy.redact_mail(mail)
         return mail.model_copy(update=clip_body(mail.body_text, mail.body_truncated, max_chars))
 
+    @audited
     def get_thread(self, conversation_id: str, limit: int = 20) -> list[MailSummary]:
         limit = _check_limit(limit)
         found = self._gw.get_thread(conversation_id, limit, self._policy.mail_visible)

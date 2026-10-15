@@ -33,3 +33,11 @@ class NotFound(OutlookBridgeError):
 
 class InvalidRequest(OutlookBridgeError):
     """Bad parameters (range too wide, end before start...)."""
+
+
+class ConfigError(OutlookBridgeError):
+    """Invalid config.toml, or snapshot_dir missing or relative."""
+
+
+class ExportError(OutlookBridgeError):
+    """Snapshot folder missing, inside a git work tree, or write failure."""
