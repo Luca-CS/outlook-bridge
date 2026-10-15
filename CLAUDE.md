@@ -17,7 +17,7 @@ Un seul cœur Python (`outlook_bridge.core`) sert trois sorties : CLI (typer), s
 La spec de référence est `OUTLOOK_BRIDGE_SPEC.md`. En cas de doute, c'est elle qui fait foi ; ce fichier n'en est que le condensé.
 
 ## Phase en cours
-**Phase 2 (CLI, snapshots, journal d'audit) : décisions validées, revue adversariale corrigée ; en attente de validation avant la Phase 3 (serveur MCP).** Constats et écarts : `docs/phase0-report.md` à `docs/phase2-report.md`.
+**Phase 2 terminée et mergée. Phase 3 (serveur MCP FastMCP stdio, outils §5.2) : en cours.** Constats et écarts : `docs/phase0-report.md` à `docs/phase2-report.md`.
 Environnement : le `python` en tête du PATH est celui de MSYS2/mingw, incompatible avec pywin32. Toujours passer par `uv run` (CPython de `.python-version`), jamais par le `python` nu. `tzdata` est requis (Windows n'a pas de base IANA).
 Travailler phase par phase (spec §10). À chaque point de contrôle : lancer les tests, résumer ce qui marche et ce qui ne marche pas, **attendre la validation** avant la phase suivante. Faire un commit git en fin de phase (en anglais, conventionnel : `feat:`, `fix:`, `test:`, `docs:`).
 Si une hypothèse de la spec est fausse sur cette machine (version d'Outlook, locale, comportement COM), le signaler et proposer un ajustement plutôt que de contourner en silence.
@@ -59,3 +59,23 @@ uv run python scripts/spike.py     # Phase 0
 - **Expéditeur Exchange** (`SenderEmailType == "EX"`) : `Sender.GetExchangeUser().PrimarySmtpAddress`, avec repli sur `SenderName`.
 - Toujours `GetItemFromID(entry_id, store_id)`, car il y a plusieurs comptes. Les `Table` renvoient des EntryID **à court terme** (`EF…`, valables pour la session) : utiliser la colonne `…/proptag/0x66700102`. Les occurrences d'une série partagent l'EntryID (cibler via `start`) et leur `Parent` est l'élément maître.
 - Nouvel Outlook = pas de COM : renvoyer une erreur claire. Lancer Python et Outlook **sans élévation**. Si l'Object Model Guard se déclenche, le documenter sans le contourner.
+
+<!-- subagent-budget:start -->
+## Delegation and agent budget
+
+The user is on a limited plan. Usage is the constraint, not model access. Spend it deliberately.
+
+- Default to doing the work in the main session. Do not use a workflow or subagents for small or already-understood changes: the handoff and the review cost as much as the work.
+- Maximum 3 concurrent agents, and keep workflows under 5 agents in total, unless the user explicitly asks for more. When unsure whether a task warrants fan-out, ask.
+- Route by task, not by habit:
+  - Pick the smallest model you are very confident can complete each delegated task (subagent or workflow stage), and match the effort level to the task: low for mechanical work, medium by default, high only for hard reasoning, security or verification.
+  - haiku: exploration, grep/reading, collecting facts, mechanical edits, git operations.
+  - sonnet: implementation, tests, routine review.
+  - opus: architecture, hard debugging, security-sensitive or concurrency-heavy changes. At most 1 to 2 Opus agents at a time.
+- Always name the model explicitly when spawning a subagent or writing a workflow stage. Never rely on inheriting the session model for fan-out stages.
+- Use the custom agents: `scoper` (unfamiliar task, before planning), `implementer` (well-defined code or test changes), `shipper` (commit/push/PR when asked), `reviewer` (only when asked or for risky changes).
+- A subagent starts with an empty context: give it the goal, acceptance criteria, relevant files, decisions already taken, and the commands to validate.
+- Keep architecture, scope and ambiguity in the main session. Review every returned diff yourself before reporting done. Send corrections back to the same agent with SendMessage to keep its context.
+- ultracode is opt-in per task (the `ultracode:` keyword). Do not recommend turning it on for the whole session.
+- Before a large fan-out, say how many agents and which models you plan to use, in one line.
+<!-- subagent-budget:end -->
