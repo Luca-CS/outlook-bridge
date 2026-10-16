@@ -13,11 +13,11 @@ Le repo est **public**. Cette règle prime sur toutes les autres, y compris sur 
 
 ## Objectif
 Outil local qui donne à Claude un accès **en lecture seule** à l'Outlook classique de bureau (mails, réunions, calendriers) via **COM (pywin32)**, sans Entra ID, Graph ni OAuth.
-Un seul cœur Python (`outlook_bridge.core`) sert trois sorties : CLI (typer), serveur MCP stdio (FastMCP) et export de snapshots JSON/MD.
+Un seul cœur Python (`outlook_bridge.core`) sert trois sorties : CLI (typer), serveur MCP stdio (`MCPServer` du SDK `mcp` 2.x, ex-FastMCP) et export de snapshots JSON/MD.
 La spec de référence est `OUTLOOK_BRIDGE_SPEC.md`. En cas de doute, c'est elle qui fait foi ; ce fichier n'en est que le condensé.
 
 ## Phase en cours
-**Phase 2 (CLI, snapshots, journal d'audit) : décisions validées, revue adversariale corrigée ; en attente de validation avant la Phase 3 (serveur MCP).** Constats et écarts : `docs/phase0-report.md` à `docs/phase2-report.md`.
+**Phase 3 (serveur MCP stdio, 9 outils §5.2) : terminée, en attente de validation (les 4 cas d'usage §1 dans Claude Code) avant la Phase 4 (Claude Desktop, MCPB).** Constats et écarts : `docs/phase0-report.md` à `docs/phase3-report.md`.
 Environnement : le `python` en tête du PATH est celui de MSYS2/mingw, incompatible avec pywin32. Toujours passer par `uv run` (CPython de `.python-version`), jamais par le `python` nu. `tzdata` est requis (Windows n'a pas de base IANA).
 Travailler phase par phase (spec §10). À chaque point de contrôle : lancer les tests, résumer ce qui marche et ce qui ne marche pas, **attendre la validation** avant la phase suivante. Faire un commit git en fin de phase (en anglais, conventionnel : `feat:`, `fix:`, `test:`, `docs:`).
 Si une hypothèse de la spec est fausse sur cette machine (version d'Outlook, locale, comportement COM), le signaler et proposer un ajustement plutôt que de contourner en silence.
@@ -29,7 +29,7 @@ uv run pytest tests/test_redact.py::test_x   # un seul test
 uv run pytest -m outlook           # intégration : Windows + Outlook réels
 uv run ruff check . && uv run ruff format .
 uv run outlook-bridge status|mails|mail <n°>|events|slots|export   # --help ; dates : 2d, +7d, auj, 16/10, 14:00
-uv run outlook-bridge-mcp          # serveur MCP stdio
+uv run outlook-bridge-mcp          # serveur MCP stdio (déclaré pour Claude Code dans .mcp.json)
 uv run mcp dev src/outlook_bridge/mcp_server.py   # inspecteur MCP
 uv run python scripts/spike.py     # Phase 0
 ```
@@ -45,6 +45,7 @@ uv run python scripts/spike.py     # Phase 0
 - `src/outlook_bridge/gateway.py` définit le Protocol `OutlookGateway`. **Seul `com_gateway.py` touche COM** (et fait la conversion COM → modèles). Toute la logique (filtres DASL/Jet, créneaux libres, exclusions, rédaction, dates) vit dans `mail.py`, `events.py` (pas `calendar.py` : masquerait le module standard), `redact.py`, `timeutil.py` et se teste sur `tests/fakes.py::FakeGateway`.
 - Les exclusions passent au gateway sous forme de prédicat `accept` pour que `limit` compte les éléments visibles ; la rédaction est faite avant troncature.
 - `core.Bridge` est le point d'entrée unique ; `cli.py`, `mcp_server.py` et `export.py` en sont de fines couches et ne renvoient que des modèles pydantic (`models.py`).
+- Serveur MCP (`mcp_server.py`) : dates en ISO 8601 seul (`timeutil.parse_iso`, jour seul en fin de plage inclus), sortie JSON compact en un bloc texte sans caractères invisibles, `OutlookBridgeError` renvoyée telle quelle et toute autre exception réduite à « Erreur interne (<Classe>) » avant que le SDK ne la journalise.
 - Journal d'audit (`audit.py`) : `@audited` sur les 9 méthodes du cœur = outils MCP (§5.2) ; `Bridge.from_environment(source="cli"|"mcp")` le branche, un `Bridge(...)` construit à la main n'écrit rien. Aucun code d'audit dans les frontaux ; jamais de `print(` ni `sys.stdout` hors `cli.py` (canal stdio MCP), vérifié par `tests/test_layering.py`.
 - Tests : une fixture autouse redirige `OUTLOOK_BRIDGE_CONFIG` et `OUTLOOK_BRIDGE_DATA_DIR` vers `tmp_path` ; aucun test ne lit la vraie config ni n'écrit dans le vrai profil.
 - Packaging Desktop en Phase 4 via MCPB (`mcpb/manifest.json`) ; skills en Phase 5 dans `skills/<nom>/SKILL.md`.
@@ -59,3 +60,23 @@ uv run python scripts/spike.py     # Phase 0
 - **Expéditeur Exchange** (`SenderEmailType == "EX"`) : `Sender.GetExchangeUser().PrimarySmtpAddress`, avec repli sur `SenderName`.
 - Toujours `GetItemFromID(entry_id, store_id)`, car il y a plusieurs comptes. Les `Table` renvoient des EntryID **à court terme** (`EF…`, valables pour la session) : utiliser la colonne `…/proptag/0x66700102`. Les occurrences d'une série partagent l'EntryID (cibler via `start`) et leur `Parent` est l'élément maître.
 - Nouvel Outlook = pas de COM : renvoyer une erreur claire. Lancer Python et Outlook **sans élévation**. Si l'Object Model Guard se déclenche, le documenter sans le contourner.
+
+<!-- subagent-budget:start -->
+## Delegation and agent budget
+
+The user is on a limited plan. Usage is the constraint, not model access. Spend it deliberately.
+
+- Default to doing the work in the main session. Do not use a workflow or subagents for small or already-understood changes: the handoff and the review cost as much as the work.
+- Maximum 3 concurrent agents, and keep workflows under 5 agents in total, unless the user explicitly asks for more. When unsure whether a task warrants fan-out, ask.
+- Route by task, not by habit:
+  - Pick the smallest model you are very confident can complete each delegated task (subagent or workflow stage), and match the effort level to the task: low for mechanical work, medium by default, high only for hard reasoning, security or verification.
+  - haiku: exploration, grep/reading, collecting facts, mechanical edits, git operations.
+  - sonnet: implementation, tests, routine review.
+  - opus: architecture, hard debugging, security-sensitive or concurrency-heavy changes. At most 1 to 2 Opus agents at a time.
+- Always name the model explicitly when spawning a subagent or writing a workflow stage. Never rely on inheriting the session model for fan-out stages.
+- Use the custom agents: `scoper` (unfamiliar task, before planning), `implementer` (well-defined code or test changes), `shipper` (commit/push/PR when asked), `reviewer` (only when asked or for risky changes).
+- A subagent starts with an empty context: give it the goal, acceptance criteria, relevant files, decisions already taken, and the commands to validate.
+- Keep architecture, scope and ambiguity in the main session. Review every returned diff yourself before reporting done. Send corrections back to the same agent with SendMessage to keep its context.
+- ultracode is opt-in per task (the `ultracode:` keyword). Do not recommend turning it on for the whole session.
+- Before a large fan-out, say how many agents and which models you plan to use, in one line.
+<!-- subagent-budget:end -->

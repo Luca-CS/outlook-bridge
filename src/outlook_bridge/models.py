@@ -90,6 +90,8 @@ class Event(_Model):
     is_recurring: bool = False
     response_status: ResponseStatus = "none"
     online_meeting_url: str | None = None
+    # True as well when only the location says so (list_events loads no body): Phase 3 probe.
+    has_online_meeting: bool = False
     body_text: str | None = None  # only filled by get_event
     body_truncated: bool = False
 
@@ -148,7 +150,7 @@ class SnapshotEvent(_Model):
             busy_status=event.busy_status,
             response_status=event.response_status,
             is_recurring=event.is_recurring,
-            has_online_meeting=bool(event.online_meeting_url),
+            has_online_meeting=event.has_online_meeting or bool(event.online_meeting_url),
             calendar=event.calendar,
             account=event.account,
         )

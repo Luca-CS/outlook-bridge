@@ -30,6 +30,39 @@ def clip_body(body: str, truncated: bool, max_chars: int) -> dict[str, str | boo
     return {"body_text": body[:max_chars], "body_truncated": truncated or len(body) > max_chars}
 
 
+LONG_URL = 80  # longer links become `<lien : domaine>`
+MAX_HOST_CHARS = 60
+# Outlook writes an HTML link as `texte <URL>`: the brackets go with the URL they enclose.
+_URL = re.compile(r"<(https?://[^\s<>]+)>|https?://[^\s<>\"']+", re.IGNORECASE)
+_URL_TAIL = ".,;:!?)]}'\""
+# Authority of a matched link: optional user info, then the host (a bracketed IPv6 or a name).
+# A backslash ends it, as in browsers: `https://a.example\@b.example/` goes to a.example.
+_HOST = re.compile(r"https?://(?:[^/?#@\\]*@)?(\[[^\]]*\]|[^/?#:\\]*)", re.IGNORECASE)
+
+
+def shorten_urls(text: str, max_len: int = LONG_URL) -> str:
+    """Newsletter tracking links can fill the whole body budget before any text: each link
+    longer than `max_len` becomes `<lien : domaine>`. The gateway runs this before cutting
+    the body (and after looking for a meeting link, which must stay whole)."""
+
+    def replace(match: re.Match[str]) -> str:
+        url, tail = match[1], ""
+        if url is None:  # bare link: keep the punctuation that follows it
+            url = match[0].rstrip(_URL_TAIL)
+            tail = match[0][len(url) :]
+        if len(url) <= max_len:
+            return match[0]
+        return f"<lien : {_host(url)}>{tail}"
+
+    return _URL.sub(replace, text)
+
+
+def _host(url: str) -> str:
+    """Lower-case host of a link, without user info or port (regex: no urllib in src/)."""
+    match = _HOST.match(url)
+    return ((match[1] if match else "") or "?").lower()[:MAX_HOST_CHARS]
+
+
 M = TypeVar("M", MailSummary, MailDetail)
 
 

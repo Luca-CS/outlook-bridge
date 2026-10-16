@@ -91,6 +91,12 @@ def _strip_controls(text: str) -> str:
     return _INVISIBLE.sub("", _ESCAPES.sub("", text))
 
 
+def strip_invisible(text: str) -> str:
+    """Removes the invisible characters only (bidi overrides, Unicode tags...): text a human
+    reviewer cannot see but a model reads. Safe on serialised JSON, whose syntax is ASCII."""
+    return _INVISIBLE.sub("", text)
+
+
 def _cut(text: str, max_len: int | None) -> str:
     if max_len is None or len(text) <= max_len:
         return text

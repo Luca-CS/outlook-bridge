@@ -5,7 +5,7 @@ import pytest
 from outlook_bridge.config import Config
 from outlook_bridge.core import Bridge
 from outlook_bridge.errors import InvalidRequest, NotFound
-from outlook_bridge.events import build_jet_range, find_meeting_url
+from outlook_bridge.events import build_jet_range, find_meeting_url, online_location
 from tests.fakes import NOW, PARIS, STORE, FakeGateway, make_event
 
 DAY = datetime(2026, 10, 13, tzinfo=PARIS)  # Tuesday
@@ -114,3 +114,20 @@ def test_jet_range_uses_day_first_local_format():
 )
 def test_find_meeting_url(text, expected):
     assert find_meeting_url(None, text) == expected
+
+
+@pytest.mark.parametrize(
+    ("location", "expected"),
+    [
+        ("Réunion Microsoft Teams", True),
+        ("Microsoft Teams Meeting", True),
+        ("Salle A; Réunion Microsoft Teams", True),
+        ("MICROSOFT TEAMS", True),
+        ("Salle Teams", False),  # "teams" alone may be a room name
+        ("Salle A", False),
+        ("", False),
+        (None, False),
+    ],
+)
+def test_online_location(location: str | None, expected: bool):
+    assert online_location(location) is expected

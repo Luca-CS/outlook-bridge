@@ -60,6 +60,13 @@ _ISO_DATE = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
 _FR_DATE = re.compile(r"(\d{1,2})/(\d{1,2})(?:/(\d{4}))?")
 _TIME = re.compile(r"(\d{1,2})(?::(\d{2})|h(\d{2})?)")
 _DATE_TIME = re.compile(r"([\d/-]{3,10})(?:[ t]([\d:h]{2,5}))?")
+# MCP tools (Phase 3): ISO 8601 only, extended format. An offset needs a time.
+_ISO = re.compile(
+    r"\d{4}-\d{2}-\d{2}"
+    r"(?P<time>[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?(?:Z|[+-]\d{2}:\d{2})?)?",
+    re.ASCII,
+)
+ISO_FORMATS = "2026-10-16 (jour entier) ou 2026-10-16T14:30 (heure de Paris si aucun fuseau)"
 
 
 def to_aware(
@@ -177,6 +184,35 @@ def parse_when(
             f"{label} désigne une date future (« {shown} ») : utilisez 2d pour « il y a 2 jours »."
         )
     return result
+
+
+def parse_iso(
+    text: str, role: Role, *, tz: tzinfo = DEFAULT_TZ, label: str | None = None
+) -> datetime:
+    """Parse an MCP tool date: ISO 8601 only (Phase 3 decision), aware in `tz`.
+
+    A day alone resolves by role like `parse_when`: its midnight for "since"/"from", the next
+    midnight for "to" (exclusive bound, so the day itself is included). A time without offset
+    is local time in `tz`; an explicit offset or Z is honoured. No relative grammar: the model
+    knows the date, and "2d" or "16/10" would be ambiguous. Raises InvalidRequest.
+    """
+    if role not in ROLES:
+        raise ValueError(f"unknown role: {role!r}")
+    label = label or role
+    candidate = text.strip()
+    match = _ISO.fullmatch(candidate) if len(candidate) <= MAX_WHEN_CHARS else None
+    try:
+        parsed = datetime.fromisoformat(candidate) if match else None
+    except ValueError:
+        parsed = None
+    if parsed is None or not MIN_YEAR <= parsed.year <= MAX_YEAR:
+        raise InvalidRequest(
+            f"Date invalide pour {label} : « {_shown(text)} ». Format ISO 8601 : {ISO_FORMATS}."
+        )
+    if match["time"] is None:
+        day = parsed.date()
+        return day_start(day + timedelta(days=1) if role == "to" else day, tz)
+    return normalize(parsed, tz)
 
 
 def _normalize_text(text: str) -> str:
