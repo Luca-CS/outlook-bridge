@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "outlook": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "--quiet", "outlook-bridge-mcp"]
+    }
+  }
+}

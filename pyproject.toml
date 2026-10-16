@@ -7,6 +7,7 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "mcp>=2.3.0",
     "pydantic>=2.14.1",
     "pywin32>=312",
     "typer>=0.27.3",
@@ -15,6 +16,7 @@ dependencies = [
 
 [project.scripts]
 outlook-bridge = "outlook_bridge.cli:main"
+outlook-bridge-mcp = "outlook_bridge.mcp_server:main"
 
 [build-system]
 requires = ["uv_build>=0.13.0,<0.14.0"]

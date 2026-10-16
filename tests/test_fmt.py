@@ -500,6 +500,7 @@ def test_time_span_marks_the_following_days_as_suite():
             },
             ["provisoire", "récurrent", "visio"],
         ),
+        ({"has_online_meeting": True}, ["visio"]),  # Teams location, no link loaded
     ],
 )
 def test_event_flags(overrides: dict, expected: list[str]):

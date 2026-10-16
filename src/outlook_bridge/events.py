@@ -28,6 +28,18 @@ _MEETING_URL = re.compile(
 )
 
 
+# Locations Outlook writes for a Teams meeting ("Réunion Microsoft Teams", "Microsoft Teams
+# Meeting", "Salle A; Réunion Microsoft Teams"). The Phase 3 probe found them on exactly the
+# events that carry a Teams link, so list_events can flag them without loading any body.
+ONLINE_LOCATION_MARKERS = ("microsoft teams",)
+
+
+def online_location(location: str | None) -> bool:
+    """Whether the location names an online meeting service."""
+    folded = (location or "").casefold()
+    return any(marker in folded for marker in ONLINE_LOCATION_MARKERS)
+
+
 def find_meeting_url(*texts: str | None) -> str | None:
     """First Teams / Zoom / Meet / Webex link found in the given texts."""
     for text in texts:

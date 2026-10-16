@@ -27,7 +27,7 @@ from outlook_bridge.errors import (
     OutlookNotRunning,
     OutlookUnavailable,
 )
-from outlook_bridge.events import build_jet_range, find_meeting_url
+from outlook_bridge.events import build_jet_range, find_meeting_url, online_location
 from outlook_bridge.gateway import AcceptEvent, AcceptMail, MailQuery
 from outlook_bridge.mail import build_dasl_filter, folder_not_found
 from outlook_bridge.models import (
@@ -44,6 +44,7 @@ from outlook_bridge.models import (
     ResponseStatus,
     Status,
 )
+from outlook_bridge.redact import shorten_urls
 from outlook_bridge.timeutil import DEFAULT_TZ, to_aware, to_com
 
 T = TypeVar("T")
@@ -100,6 +101,12 @@ DASL_THREAD_TOPIC = "urn:schemas:httpmail:thread-topic"
 # Table rows carry *short-term* EntryIDs in cached mode (valid for the session only).
 COL_LONGTERM_ID = PT + "0x66700102"
 PR_MESSAGE_DELIVERY_TIME = PT + "0x0E060040"
+# Named property (PS_PUBLIC_STRINGS) the Teams add-in sets; IsOnlineMeeting stays False for
+# Teams meetings (Phase 3 probe).
+PR_TEAMS_MEETING_URL = (
+    "http://schemas.microsoft.com/mapi/string/{00020329-0000-0000-C000-000000000046}/"
+    "SkypeTeamsMeetingUrl"
+)
 MAIL_COLUMNS = (
     "EntryID",
     COL_LONGTERM_ID,
@@ -263,7 +270,16 @@ def _snippet(text: str | None, *, outlook_preview: bool = False) -> str:
     text = text or ""
     if outlook_preview and len(text) >= PREVIEW_CAP:
         text = text[: len(text) - PREVIEW_TAIL]
-    return " ".join(text.split())[: SNIPPET_MAX + REDACT_MARGIN]
+    return " ".join(shorten_urls(text).split())[: SNIPPET_MAX + REDACT_MARGIN]
+
+
+def _teams_url(item: Any) -> str | None:
+    """Join link the Teams add-in stores on the appointment, if it is a meeting URL."""
+    try:
+        value = item.PropertyAccessor.GetProperty(PR_TEAMS_MEETING_URL)
+    except pywintypes.com_error:
+        return None
+    return find_meeting_url(value) if isinstance(value, str) else None
 
 
 def _clean_body(text: str | None) -> str:
@@ -562,7 +578,7 @@ class ComGateway:
             or to_aware(_get(item, "ReceivedTime"), tz=self._tz)
             or to_aware(_get(item, "CreationTime"), tz=self._tz)
         )
-        body = _clean_body(_get(item, "Body", ""))
+        body = shorten_urls(_clean_body(_get(item, "Body", "")))  # before the cut
         attachments = [
             Attachment(
                 name=str(_get(att, "FileName", "") or _get(att, "DisplayName", "")),
@@ -670,8 +686,13 @@ class ComGateway:
         venue = str(_get(item, "Location", ""))
         body = None
         truncated = False
+        meeting_url = find_meeting_url(venue)
         if max_chars is not None:
             full = _clean_body(_get(item, "Body", ""))
+            # The meeting link is looked for in the whole body, before links are shortened,
+            # then in the Teams property (~30 ms a read: get_event only, never list_events).
+            meeting_url = meeting_url or find_meeting_url(full) or _teams_url(item)
+            full = shorten_urls(full)
             body, truncated = full[:max_chars], len(full) > max_chars
         return Event(
             id=str(item.EntryID),
@@ -689,7 +710,8 @@ class ComGateway:
             busy_status=BUSY.get(int(_get(item, "BusyStatus", 2)), "busy"),
             is_recurring=bool(_get(item, "IsRecurring", False)),
             response_status=RESPONSE.get(int(_get(item, "ResponseStatus", 0)), "none"),
-            online_meeting_url=find_meeting_url(venue, body),
+            online_meeting_url=meeting_url,
+            has_online_meeting=bool(meeting_url) or online_location(venue),
             body_text=body,
             body_truncated=truncated,
         )

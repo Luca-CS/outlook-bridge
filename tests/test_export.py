@@ -190,6 +190,8 @@ def test_snapshot_event_is_an_allow_list():
     assert snapshot_event(events()[0]).has_online_meeting is False
     assert snapshot_event(events()[0]).location == "Salle A"
     assert SnapshotEvent.from_event(events()[0]).has_online_meeting is False
+    flagged = events()[0].model_copy(update={"has_online_meeting": True})
+    assert snapshot_event(flagged).has_online_meeting is True  # location only, no link
 
 
 def test_snapshot_event_copies_attendee_lists():

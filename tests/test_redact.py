@@ -6,7 +6,7 @@ import pytest
 
 from outlook_bridge.config import Config
 from outlook_bridge.models import REDACT_MARGIN, SNIPPET_MAX
-from outlook_bridge.redact import REDACTED, Policy
+from outlook_bridge.redact import MAX_HOST_CHARS, REDACTED, Policy, shorten_urls
 from tests.fakes import NOW, make_event, make_mail
 
 IBAN = "FR12 3456 7890 1234 5678 9012 345"  # invented, IBAN-shaped
@@ -188,3 +188,67 @@ def test_real_snapshots_are_deleted_even_on_failure():
             for node in ast.walk(func)
         )
         assert cleaned, func.name
+
+
+# --- shorten_urls (Phase 3): long links become `<lien : domaine>` -------------------------
+
+TRACKING = "https://click.news.example.com/ls/click?upn=" + "a1B2c3D4" * 30  # 285 chars
+
+
+def test_long_bracketed_link_is_shortened_with_its_brackets():
+    text = f"Lire l'article <{TRACKING}> puis la suite."
+    assert shorten_urls(text) == "Lire l'article <lien : click.news.example.com> puis la suite."
+
+
+def test_long_bare_link_keeps_its_trailing_punctuation():
+    assert shorten_urls(f"Voir {TRACKING}.") == "Voir <lien : click.news.example.com>."
+    assert shorten_urls(f"(voir {TRACKING}),") == "(voir <lien : click.news.example.com>),"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Le document : https://example.com/doc/42",
+        "Lien <https://example.com/a?b=c>.",
+        "mailto:alice@example.com et www.example.com/" + "x" * 100,  # no scheme: not a link
+        "Aucun lien ici.",
+        "",
+    ],
+)
+def test_short_links_and_plain_text_are_unchanged(text: str):
+    assert shorten_urls(text) == text
+
+
+def test_threshold_is_inclusive():
+    url = "https://example.com/" + "p" * 60
+    assert shorten_urls(url, max_len=len(url)) == url
+    assert shorten_urls(url, max_len=len(url) - 1) == "<lien : example.com>"
+
+
+@pytest.mark.parametrize(
+    ("url", "host"),
+    [
+        ("HTTPS://Tracking.Example.COM/" + "x" * 90, "tracking.example.com"),
+        ("https://user:pw@example.com:8443/" + "x" * 90, "example.com"),
+        ("https://[2001:db8::1]:443/" + "x" * 90, "[2001:db8::1]"),
+        ("https://example.com?" + "x" * 90, "example.com"),
+        (r"https://evil.example\@good.example/" + "x" * 90, "evil.example"),  # browsers: \ = /
+        ("https:///" + "x" * 90, "?"),
+        ("https://" + "h" * 100 + ".example.com/x", "h" * MAX_HOST_CHARS),
+    ],
+)
+def test_host_is_lower_case_without_user_info_or_port(url: str, host: str):
+    assert shorten_urls(url) == f"<lien : {host}>"
+
+
+def test_many_links_in_a_newsletter_leave_room_for_the_text():
+    body = "\n".join(f"Article {n} <{TRACKING}{n}>" for n in range(20))
+    shortened = shorten_urls(body)
+    assert "Article 19 <lien : click.news.example.com>" in shortened
+    assert len(shortened) < len(body) // 5
+    assert shorten_urls(shortened) == shortened  # idempotent
+
+
+def test_shortening_drops_what_redaction_would_have_to_find_in_a_link():
+    text = f"https://bank.example.com/rib?iban={IBAN.replace(' ', '')}&" + "x" * 60
+    assert IBAN.replace(" ", "") not in shorten_urls(text)
